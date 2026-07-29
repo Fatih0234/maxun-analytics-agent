@@ -9,6 +9,10 @@ interface Props {
 
 export function ChartMessage({ payload, onRenderError }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Holds the live Vega view so it can be disposed on unmount. Without this the
+  // view keeps its RAF loop and listeners alive; once the message list is
+  // virtualized and unmounts off-screen charts, leaking them defeats the point.
+  const viewRef = useRef<{ finalize: () => void } | null>(null);
   const [embedError, setEmbedError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -29,12 +33,16 @@ export function ChartMessage({ payload, onRenderError }: Props) {
         renderer: "svg",
         actions: { export: true, editor: false, source: false },
         tooltip: { theme: "custom" },
-      }).catch((err) => {
-        console.error("Vega-Lite render error:", err);
-        const msg = String(err?.message || err);
-        setEmbedError(msg);
-        onRenderError?.(msg);
-      });
+      })
+        .then((result) => {
+          viewRef.current = result.view;
+        })
+        .catch((err) => {
+          console.error("Vega-Lite render error:", err);
+          const msg = String(err?.message || err);
+          setEmbedError(msg);
+          onRenderError?.(msg);
+        });
     };
 
     // Use ResizeObserver so chart fills width even after layout settles
@@ -53,7 +61,11 @@ export function ChartMessage({ payload, onRenderError }: Props) {
       observer.disconnect();
     }
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      viewRef.current?.finalize();
+      viewRef.current = null;
+    };
   }, [payload.vega_lite_spec]);
 
   if (!payload.vega_lite_spec || Object.keys(payload.vega_lite_spec).length === 0) {

@@ -181,27 +181,38 @@ export function ChatView() {
   const [showReasoning, setShowReasoning] = useState(true);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportIncludeReasoning, setExportIncludeReasoning] = useState(false);
+  // While true, MessageList renders the full transcript unvirtualized so
+  // window.print() captures every turn (not just the on-screen ones).
+  const [printing, setPrinting] = useState(false);
 
   const handleExport = useCallback(() => {
-    document.querySelectorAll("[data-print-expand]").forEach((el) => {
-      (el as HTMLElement).style.maxHeight = "none";
-      (el as HTMLElement).style.overflow = "visible";
-      (el as HTMLElement).style.opacity = "1";
-    });
+    // Switch MessageList out of virtualization first, then wait two frames so
+    // the full transcript is painted before we snapshot it for print.
+    setPrinting(true);
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        document.querySelectorAll("[data-print-expand]").forEach((el) => {
+          (el as HTMLElement).style.maxHeight = "none";
+          (el as HTMLElement).style.overflow = "visible";
+          (el as HTMLElement).style.opacity = "1";
+        });
 
-    const slugify = (s: string) =>
-      s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+        const slugify = (s: string) =>
+          s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 
-    const appName = slugify(useDisplayStore.getState().appName || "analytics-agent");
-    const title   = slugify(activeConv?.title ?? "conversation");
-    const ts      = new Date().toISOString().slice(0, 16).replace("T", "-").replace(":", "");
-    const filename = `${appName}-${title}-${ts}`;
+        const appName = slugify(useDisplayStore.getState().appName || "analytics-agent");
+        const title   = slugify(activeConv?.title ?? "conversation");
+        const ts      = new Date().toISOString().slice(0, 16).replace("T", "-").replace(":", "");
+        const filename = `${appName}-${title}-${ts}`;
 
-    const prev = document.title;
-    document.title = filename;
-    window.print();
-    document.title = prev;
-    setExportModalOpen(false);
+        const prev = document.title;
+        document.title = filename;
+        window.print();
+        document.title = prev;
+        setPrinting(false);
+        setExportModalOpen(false);
+      })
+    );
   }, [activeConv?.title]);
 
   const handleSend = async (text: string) => {
@@ -360,6 +371,7 @@ export function ChatView() {
         messages={messages}
         isStreaming={isStreaming}
         showReasoning={showReasoning}
+        printing={printing}
         onChartError={(error) => {
           if (chartErrorRetried.current || isStreaming) return;
           chartErrorRetried.current = true;
