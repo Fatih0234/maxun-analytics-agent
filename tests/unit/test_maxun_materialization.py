@@ -102,6 +102,35 @@ def test_schema_skew_is_rejected():
     assert error.value.code == "MATERIALIZATION_SCHEMA_MISMATCH"
 
 
+def test_compatible_sources_share_one_data_relation(tmp_path: Path):
+    body = payload()
+    second = dict(body["sources"][0])
+    second.update(
+        {
+            "workspaceSourceId": "88888888-8888-4888-8888-888888888888",
+            "projectionId": "99999999-9999-4999-8999-999999999999",
+            "sourceOrder": 1,
+            "displayName": "Benchmark",
+            "role": "benchmark",
+            "projection": {
+                "columns": ["Price", "_source", "Name", "name"],
+                "rows": [{"Price": "2", "_source": "x", "Name": "a", "name": "b"}],
+            },
+        }
+    )
+    body["sources"].append(second)
+    request = MaterializationRequest.model_validate(body)
+    result = Materializer(tmp_path).materialize(request)
+    assert result["sourceCount"] == 2
+    assert result["rowCount"] == 2
+    database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select count(distinct _workspace_source_id) from data"
+        ).fetchone() == (2,)
+        assert connection.execute("select count(*) from __maxun_sources").fetchone() == (2,)
+
+
 def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
