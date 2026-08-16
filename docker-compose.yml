@@ -26,8 +26,13 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://talk_to_data:talk_to_data@postgres:5432/talk_to_data
+      MAXUN_MATERIALIZATION_ROOT: /var/lib/maxun-analytics/materializations
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - maxun_materializations:/var/lib/maxun-analytics/materializations
+
+volumes:
+  maxun_materializations:
