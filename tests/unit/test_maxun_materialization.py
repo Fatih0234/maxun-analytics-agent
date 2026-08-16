@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -145,6 +146,16 @@ def test_same_workspace_concurrent_builds_are_idempotent(tmp_path: Path):
         results = list(executor.map(materializer.materialize, [request, request]))
     assert results[0] == results[1]
     assert results[0]["rowCount"] == 1
+
+
+def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    os.utime(database, (100, 100))
+    assert materializer.cleanup_expired(ttl_seconds=10, now=111) == 1
+    assert not database.exists()
 
 
 def test_integrity_conflict_is_rejected(tmp_path: Path):

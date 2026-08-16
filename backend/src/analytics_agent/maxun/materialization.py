@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import shutil
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -684,6 +685,33 @@ class Materializer:
                     "MATERIALIZATION_INVALID_CONTRACT", "invalid materialization path"
                 )
             shutil.rmtree(directory)
+
+    def cleanup_expired(self, ttl_seconds: int = 86_400, now: float | None = None) -> int:
+        if ttl_seconds < 1:
+            raise ValueError("ttl_seconds must be positive")
+        base = self.root / "v1"
+        if not base.exists():
+            return 0
+        current = now if now is not None else time.time()
+        removed = 0
+        for directory in base.iterdir():
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            try:
+                workspace_id = str(UUID(directory.name))
+                if directory.resolve().parent != base.resolve():
+                    continue
+                final = directory / "workspace.duckdb"
+                if not final.exists() or current - final.stat().st_mtime <= ttl_seconds:
+                    continue
+                _, _, lock_path = self._paths(workspace_id)
+                with _lock(lock_path):
+                    if final.exists() and current - final.stat().st_mtime > ttl_seconds:
+                        shutil.rmtree(directory)
+                        removed += 1
+            except (OSError, ValueError):
+                continue
+        return removed
 
 
 def configured_token() -> str:
