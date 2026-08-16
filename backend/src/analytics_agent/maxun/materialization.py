@@ -157,6 +157,13 @@ class MaterializationRequest(BaseModel):
                 if set(row) != set(columns):
                     raise ValueError("row keys do not match columns")
                 _reject_nonfinite(row)
+                if any(
+                    len(canonical_json(row[column]).encode("utf-8")) > MAX_CELL_BYTES
+                    for column in columns
+                ):
+                    raise MaterializationError(
+                        "MATERIALIZATION_LIMIT_EXCEEDED", "a materialization cell is too large", 413
+                    )
             rows += len(source.projection.rows)
             cells += len(source.projection.rows) * len(columns)
         if rows > MAX_ROWS or cells > MAX_CELLS:
@@ -235,10 +242,6 @@ def _json_text(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return canonical_json(value)
     return str(value)
-
-
-def _blank(value: Any) -> bool:
-    return value == "" or value is None
 
 
 def _strict_number(value: Any) -> Decimal | None:
