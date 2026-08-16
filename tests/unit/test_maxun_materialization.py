@@ -177,6 +177,11 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
         assert connection.execute("select count(*) from __maxun_manifest").fetchone() == (1,)
     materializer.delete(IDS["workspace"])
     assert not database.exists()
+    rebuilt = materializer.materialize(request)
+    assert rebuilt == first
+    assert database.exists()
+    materializer.delete(IDS["workspace"])
+    assert not database.exists()
 
 
 def test_empty_sources_preserve_schema_and_manifests(tmp_path: Path):
@@ -355,8 +360,13 @@ def test_different_workspaces_are_isolated(tmp_path: Path):
     second_body["workspace"]["id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     second_body["workspace"]["dataSignature"] = "b" * 64
     materializer = Materializer(tmp_path)
-    materializer.materialize(MaterializationRequest.model_validate(first_body))
-    materializer.materialize(MaterializationRequest.model_validate(second_body))
+    requests = [
+        MaterializationRequest.model_validate(first_body),
+        MaterializationRequest.model_validate(second_body),
+    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(materializer.materialize, requests))
+    assert [result["rowCount"] for result in results] == [1, 1]
     databases = sorted(
         path.relative_to(tmp_path).parts for path in tmp_path.rglob("workspace.duckdb")
     )
