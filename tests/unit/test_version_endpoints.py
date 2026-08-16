@@ -13,9 +13,11 @@ Key cases exercised:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -144,6 +146,64 @@ async def test_version_endpoint_airgapped():
     assert result["update_available"] is False
 
 
+async def test_version_endpoint_reports_maxun_build_identity():
+    import analytics_agent.api as api_mod
+
+    api_mod._releases_cache.clear()
+    with (
+        patch.object(api_mod, "_fetch_releases", new=AsyncMock(return_value=[])),
+        patch("importlib.metadata.version", return_value="0.4.0"),
+        patch.object(api_mod, "_GITHUB_REPO", "Fatih0234/maxun-analytics-agent"),
+        patch.dict(
+            os.environ,
+            {
+                "ANALYTICS_AGENT_SERVICE_ID": "maxun-analytics-agent",
+                "MAXUN_ANALYTICS_IMAGE_BUILD_SHA": "abc123",
+                "MAXUN_EXPECTED_ANALYTICS_BUILD_SHA": "abc123",
+            },
+        ),
+    ):
+        result = await api_mod.get_version()
+
+    assert result["service"] == "maxun-analytics-agent"
+    assert result["build_revision"] == "abc123"
+    assert result["expected_build_revision"] == "abc123"
+    assert result["build_revision_matches"] is True
+    assert result["release_repository"] == "Fatih0234/maxun-analytics-agent"
+
+
+async def test_version_endpoint_reports_baked_revision_when_expected_revision_differs():
+    import analytics_agent.api as api_mod
+    from analytics_agent.build_identity import validate_build_identity
+
+    api_mod._releases_cache.clear()
+    with (
+        patch.object(api_mod, "_fetch_releases", new=AsyncMock(return_value=[])),
+        patch.dict(
+            os.environ,
+            {
+                "MAXUN_ANALYTICS_IMAGE_BUILD_SHA": "actual-sha",
+                "MAXUN_EXPECTED_ANALYTICS_BUILD_SHA": "expected-sha",
+            },
+        ),
+    ):
+        result = await api_mod.get_version()
+        assert result["build_revision"] == "actual-sha"
+        assert result["expected_build_revision"] == "expected-sha"
+        assert result["build_revision_matches"] is False
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MAXUN_ANALYTICS_IMAGE_BUILD_SHA": "actual-sha",
+                    "MAXUN_EXPECTED_ANALYTICS_BUILD_SHA": "expected-sha",
+                },
+            ),
+            pytest.raises(RuntimeError, match="does not match"),
+        ):
+            validate_build_identity()
+
+
 async def test_version_endpoint_up_to_date():
     import analytics_agent.api as api_mod
 
@@ -208,6 +268,28 @@ async def test_version_endpoint_malformed_tag_no_crash():
 
     # packaging.version will raise; fallback is string comparison
     assert "update_available" in result
+
+
+def test_build_identity_prefers_baked_revision_file_over_runtime_environment(tmp_path):
+    import analytics_agent.build_identity as identity
+
+    baked_file = tmp_path / "MAXUN_ANALYTICS_IMAGE_BUILD_SHA"
+    baked_file.write_text("baked-sha\n")
+    with (
+        patch.object(identity, "IMAGE_BUILD_REVISION_FILE", baked_file),
+        patch.dict(
+            os.environ,
+            {
+                "MAXUN_ANALYTICS_IMAGE_BUILD_SHA": "spoofed-runtime-sha",
+                "MAXUN_EXPECTED_ANALYTICS_BUILD_SHA": "baked-sha",
+            },
+        ),
+    ):
+        assert identity.build_identity() == {
+            "actual": "baked-sha",
+            "expected": "baked-sha",
+            "matches": True,
+        }
 
 
 async def test_version_endpoint_package_not_installed():

@@ -23,6 +23,7 @@ requires-python = ">=3.11"
 dependencies = [
     # Web
     "fastapi>=0.115.0",
+    "anyio>=4.0.0",
     "uvicorn[standard]>=0.30.0",
     # DB
     "sqlalchemy[asyncio]>=2.0.0",
@@ -45,6 +46,8 @@ dependencies = [
     "acryl-datahub[base]>=1.5.0",
     # Query engines (SQLAlchemy-based; heavy native connectors are separate packages)
     "pymysql>=1.1.0",
+    "duckdb==1.5.2",
+    "pytz>=2024.1",
     "duckdb-engine>=0.13.0",
     # Observability (OTEL) — no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
     "opentelemetry-sdk>=1.25.0",
@@ -63,6 +66,7 @@ dependencies = [
     "langchain-google-genai>=4.2.2",
     # Telemetry
     "mixpanel>=4.10.0",
+    "rfc8785==0.1.4",
 ]
 
 [project.urls]

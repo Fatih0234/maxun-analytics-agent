@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
 from fastapi import APIRouter
 
-from analytics_agent.api import chat, connectors, conversations, oauth, settings
+from analytics_agent.api import (
+    chat,
+    connectors,
+    conversations,
+    maxun_materialization,
+    oauth,
+    settings,
+)
 
 api_router = APIRouter()
 api_router.include_router(conversations.router)
@@ -13,12 +21,15 @@ api_router.include_router(chat.router)
 api_router.include_router(settings.router)
 api_router.include_router(oauth.router)
 api_router.include_router(connectors.router)
+api_router.include_router(maxun_materialization.router)
 
 # Simple in-memory cache for GitHub release data (avoids hammering the API)
 _releases_cache: dict[str, Any] = {}
 _CACHE_TTL = 3600  # 1 hour
 
-_GITHUB_REPO = "datahub-project/analytics-agent"
+_GITHUB_REPO = os.environ.get(
+    "ANALYTICS_AGENT_RELEASE_REPOSITORY", "datahub-project/analytics-agent"
+)
 _GITHUB_RELEASES_URL = f"https://api.github.com/repos/{_GITHUB_REPO}/releases"
 
 
@@ -51,8 +62,10 @@ async def _fetch_releases(limit: int = 10) -> list[dict]:
 async def get_version():
     """Return the running version and whether a newer GitHub release is available."""
     from analytics_agent._version import get_package_version
+    from analytics_agent.build_identity import build_identity
 
     current = get_package_version()
+    identity = build_identity()
 
     releases = await _fetch_releases(limit=1)
     latest_version: str | None = None
@@ -69,7 +82,12 @@ async def get_version():
             update_available = latest_version != current
 
     return {
+        "service": os.environ.get("ANALYTICS_AGENT_SERVICE_ID", "analytics-agent"),
         "current_version": current,
+        "build_revision": identity["actual"],
+        "expected_build_revision": identity["expected"],
+        "build_revision_matches": identity["matches"],
+        "release_repository": _GITHUB_REPO,
         "latest_version": latest_version,
         "update_available": update_available,
     }

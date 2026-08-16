@@ -13,6 +13,7 @@ from collections import deque
 import click
 
 from analytics_agent import bootstrap
+from analytics_agent.build_identity import validate_build_identity
 
 
 @click.group()
@@ -31,6 +32,7 @@ def cli() -> None:
 @cli.command("migrate")
 def migrate() -> None:
     """Apply Alembic migrations to the configured database."""
+    validate_build_identity()
     click.echo("→ Running database migrations…")
     bootstrap.run_migrations()
     click.echo("✓ Migrations complete.")
@@ -39,6 +41,7 @@ def migrate() -> None:
 @cli.command("seed-integrations")
 def seed_integrations() -> None:
     """Upsert config.yaml engines into the integrations table."""
+    validate_build_identity()
     click.echo("→ Seeding integrations from config.yaml…")
     asyncio.run(bootstrap.seed_integrations_from_yaml())
     click.echo("✓ Integrations seeded.")
@@ -47,6 +50,7 @@ def seed_integrations() -> None:
 @cli.command("seed-context-platforms")
 def seed_context_platforms() -> None:
     """Upsert config.yaml context platforms into the DB."""
+    validate_build_identity()
     click.echo("→ Seeding context platforms from config.yaml…")
     asyncio.run(bootstrap.seed_context_platforms_from_yaml())
     click.echo("✓ Context platforms seeded.")
@@ -55,6 +59,7 @@ def seed_context_platforms() -> None:
 @cli.command("seed-defaults")
 def seed_defaults() -> None:
     """Write first-run defaults to the settings table."""
+    validate_build_identity()
     click.echo("→ Writing first-run default settings…")
     asyncio.run(bootstrap.seed_default_settings())
     click.echo("✓ Defaults written.")
@@ -63,6 +68,7 @@ def seed_defaults() -> None:
 @cli.command("bootstrap")
 def bootstrap_cmd() -> None:
     """Run migrations + all seeds (idempotent). Intended for Helm hooks."""
+    validate_build_identity()
 
     async def _run_all_seeds() -> None:
         await bootstrap.seed_integrations_from_yaml()

@@ -1,0 +1,82 @@
+{
+  "vectors": [
+    {
+      "name": "jcs-adversarial-numbers-index-keys-unicode",
+      "request": {
+        "contractVersion": 1,
+        "workspace": {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "version": 1,
+          "dataSignature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "dataFormatId": "22222222-2222-4222-8222-222222222222",
+          "dataFormatSnapshot": {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "name": "JCS fixtures",
+            "columns": [],
+            "sourceFileName": null
+          }
+        },
+        "sources": [
+          {
+            "workspaceSourceId": "33333333-3333-4333-8333-333333333333",
+            "sourceOrder": 0,
+            "projectionId": "44444444-4444-4444-8444-444444444444",
+            "runId": "55555555-5555-4555-8555-555555555555",
+            "robotId": "66666666-6666-4666-8666-666666666666",
+            "mappingId": "77777777-7777-4777-8777-777777777777",
+            "dataFormatId": "22222222-2222-4222-8222-222222222222",
+            "sourceDatasetKey": "jcs-fixture",
+            "sourceSchemaSignature": "jcs-schema",
+            "displayName": "JCS fixture",
+            "role": "other",
+            "capturedAt": "2026-08-15T10:01:00.000Z",
+            "projection": {
+              "columns": [
+                "tiny",
+                "micro",
+                "large",
+                "huge",
+                "safeBoundary",
+                "doubleLarge",
+                "negativeZero",
+                "repeating",
+                "nearMicro",
+                "nested"
+              ],
+              "rows": [
+                {
+                  "tiny": 1e-7,
+                  "micro": 0.000001,
+                  "large": 1e20,
+                  "huge": 1e21,
+                  "safeBoundary": 9.007199254740992e15,
+                  "doubleLarge": 2.9514790517935283e20,
+                  "negativeZero": 0,
+                  "repeating": 333333333.3333333,
+                  "nearMicro": 9.999999999999997e-7,
+                  "nested": {
+                    "2": "b",
+                    "10": "a",
+                    "é": "éclair",
+                    "🦄": "unicorn",
+                    "array": [
+                      1e-7,
+                      0,
+                      {
+                        "2": "b",
+                        "10": "a"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical": "{\"contractVersion\":1,\"sources\":[{\"capturedAt\":\"2026-08-15T10:01:00.000Z\",\"columns\":[\"tiny\",\"micro\",\"large\",\"huge\",\"safeBoundary\",\"doubleLarge\",\"negativeZero\",\"repeating\",\"nearMicro\",\"nested\"],\"dataFormatId\":\"22222222-2222-4222-8222-222222222222\",\"displayName\":\"JCS fixture\",\"mappingId\":\"77777777-7777-4777-8777-777777777777\",\"projectionId\":\"44444444-4444-4444-8444-444444444444\",\"robotId\":\"66666666-6666-4666-8666-666666666666\",\"role\":\"other\",\"rows\":[{\"doubleLarge\":295147905179352830000,\"huge\":1e+21,\"large\":100000000000000000000,\"micro\":0.000001,\"nearMicro\":9.999999999999997e-7,\"negativeZero\":0,\"nested\":{\"10\":\"a\",\"2\":\"b\",\"array\":[1e-7,0,{\"10\":\"a\",\"2\":\"b\"}],\"é\":\"éclair\",\"🦄\":\"unicorn\"},\"repeating\":333333333.3333333,\"safeBoundary\":9007199254740992,\"tiny\":1e-7}],\"runId\":\"55555555-5555-4555-8555-555555555555\",\"sourceDatasetKey\":\"jcs-fixture\",\"sourceOrder\":0,\"sourceSchemaSignature\":\"jcs-schema\",\"workspaceSourceId\":\"33333333-3333-4333-8333-333333333333\"}],\"workspace\":{\"dataFormatId\":\"22222222-2222-4222-8222-222222222222\",\"dataFormatSnapshot\":{\"columns\":[],\"id\":\"22222222-2222-4222-8222-222222222222\",\"name\":\"JCS fixtures\",\"sourceFileName\":null},\"dataSignature\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"11111111-1111-4111-8111-111111111111\",\"version\":1}}",
+      "sha256": "908fdf101585e16cba922aeca862fba4eda863bfa8513c548136c249a94c67ff",
+      "wire": "{\"contractVersion\":1,\"workspace\":{\"id\":\"11111111-1111-4111-8111-111111111111\",\"version\":1,\"dataSignature\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"dataFormatId\":\"22222222-2222-4222-8222-222222222222\",\"dataFormatSnapshot\":{\"id\":\"22222222-2222-4222-8222-222222222222\",\"name\":\"JCS fixtures\",\"columns\":[],\"sourceFileName\":null}},\"sources\":[{\"workspaceSourceId\":\"33333333-3333-4333-8333-333333333333\",\"sourceOrder\":0,\"projectionId\":\"44444444-4444-4444-8444-444444444444\",\"runId\":\"55555555-5555-4555-8555-555555555555\",\"robotId\":\"66666666-6666-4666-8666-666666666666\",\"mappingId\":\"77777777-7777-4777-8777-777777777777\",\"dataFormatId\":\"22222222-2222-4222-8222-222222222222\",\"sourceDatasetKey\":\"jcs-fixture\",\"sourceSchemaSignature\":\"jcs-schema\",\"displayName\":\"JCS fixture\",\"role\":\"other\",\"capturedAt\":\"2026-08-15T10:01:00.000Z\",\"projection\":{\"columns\":[\"tiny\",\"micro\",\"large\",\"huge\",\"safeBoundary\",\"doubleLarge\",\"negativeZero\",\"repeating\",\"nearMicro\",\"nested\"],\"rows\":[{\"tiny\":1e-7,\"micro\":0.000001,\"large\":100000000000000000000,\"huge\":1e+21,\"safeBoundary\":9007199254740992,\"doubleLarge\":295147905179352830000,\"negativeZero\":0,\"repeating\":333333333.3333333,\"nearMicro\":9.999999999999997e-7,\"nested\":{\"2\":\"b\",\"10\":\"a\",\"é\":\"éclair\",\"🦄\":\"unicorn\",\"array\":[1e-7,0,{\"2\":\"b\",\"10\":\"a\"}]}}]}}]}"
+    }
+  ]
+}
