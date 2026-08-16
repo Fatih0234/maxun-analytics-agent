@@ -94,6 +94,18 @@ async def lifespan(app: FastAPI):
     await propagate_datahub_env()
     await _load_llm_config_from_db()
 
+    # Derived Maxun workspaces are disposable cache entries. Cleanup is best
+    # effort and never prevents the Analytics Agent from starting.
+    try:
+        from analytics_agent.maxun.materialization import Materializer
+
+        ttl_seconds = int(os.environ.get("MAXUN_MATERIALIZATION_TTL_SECONDS", "86400"))
+        Materializer().cleanup_expired(ttl_seconds)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Maxun materialization cleanup skipped: %s", type(exc).__name__
+        )
+
     # Telemetry — initialize after LLM config is loaded so settings.llm_provider
     # reflects any DB-stored override. The agent.started span is picked up by
     # MixpanelSpanProcessor (registered in setup_tracing) once enabled=True.
