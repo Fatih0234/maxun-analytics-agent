@@ -122,6 +122,48 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
     assert not database.exists()
 
 
+def test_supported_types_and_typed_blanks_are_materialized(tmp_path: Path):
+    columns = ["Integer", "Flag", "Day", "Moment", "Payload", "Text", "Broken"]
+    rows = [
+        {
+            "Integer": "7",
+            "Flag": True,
+            "Day": "2026-01-01",
+            "Moment": "2026-01-01T10:00:00Z",
+            "Payload": {"b": 2, "a": 1},
+            "Text": "",
+            "Broken": "1",
+        },
+        {
+            "Integer": "",
+            "Flag": "false",
+            "Day": "",
+            "Moment": "2026-01-02T10:00:00Z",
+            "Payload": None,
+            "Text": "x",
+            "Broken": "oops",
+        },
+    ]
+    body = payload(columns=columns, rows=rows)
+    body["workspace"]["dataFormatSnapshot"]["columns"] = [
+        {"name": "Integer", "type": "number"},
+        {"name": "Flag", "type": "boolean"},
+        {"name": "Day", "type": "date"},
+        {"name": "Moment", "type": "datetime"},
+        {"name": "Text", "type": "text"},
+        {"name": "Broken", "type": "number"},
+    ]
+    request = MaterializationRequest.model_validate(body)
+    result = Materializer(tmp_path).materialize(request)
+    by_name = {item["logicalName"]: item for item in result["schema"]}
+    assert by_name["Integer"]["duckdbType"] == "BIGINT"
+    assert by_name["Flag"]["duckdbType"] == "BOOLEAN"
+    assert by_name["Day"]["duckdbType"] == "DATE"
+    assert by_name["Moment"]["duckdbType"] == "TIMESTAMPTZ"
+    assert by_name["Payload"]["duckdbType"] == "VARCHAR"
+    assert by_name["Broken"]["duckdbType"] == "VARCHAR"
+
+
 def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
     columns = ["unsafe\x00name"]
     request = MaterializationRequest.model_validate(
