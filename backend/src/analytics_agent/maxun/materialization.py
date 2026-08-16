@@ -22,6 +22,9 @@ import duckdb
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_SOURCES = 100
+MAX_PROJECTION_ROWS = 10_000
+MAX_PROJECTION_COLUMNS = 500
+MAX_PROJECTION_BYTES = 25 * 1024 * 1024
 MAX_ROWS = 50_000
 # The measured safe Phase 3 envelope is one million cells. Larger shapes can be
 # revisited with a streaming transport instead of increasing in-memory JSON caps.
@@ -151,6 +154,24 @@ class MaterializationRequest(BaseModel):
             if source.dataFormatId != self.workspace.dataFormatId:
                 raise ValueError("source data format mismatch")
             columns = source.projection.columns
+            if (
+                len(columns) > MAX_PROJECTION_COLUMNS
+                or len(source.projection.rows) > MAX_PROJECTION_ROWS
+            ):
+                raise MaterializationError(
+                    "MATERIALIZATION_LIMIT_EXCEEDED", "projection limits exceeded", 413
+                )
+            if (
+                len(
+                    canonical_json({"columns": columns, "rows": source.projection.rows}).encode(
+                        "utf-8"
+                    )
+                )
+                > MAX_PROJECTION_BYTES
+            ):
+                raise MaterializationError(
+                    "MATERIALIZATION_LIMIT_EXCEEDED", "projection payload is too large", 413
+                )
             if expected_columns is None:
                 expected_columns = columns
             elif columns != expected_columns:
