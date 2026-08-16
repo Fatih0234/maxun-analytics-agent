@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event, Thread
 
 import duckdb
 import pytest
@@ -312,6 +314,26 @@ def test_same_workspace_concurrent_builds_are_idempotent(tmp_path: Path):
         results = list(executor.map(materializer.materialize, [request, request]))
     assert results[0] == results[1]
     assert results[0]["rowCount"] == 1
+
+
+def test_delete_waits_for_build_and_removes_published_database(tmp_path: Path, monkeypatch):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    started = Event()
+    original_build = materializer._build
+
+    def delayed_build(*args, **kwargs):
+        started.set()
+        time.sleep(0.05)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(materializer, "_build", delayed_build)
+    worker = Thread(target=materializer.materialize, args=(request,))
+    worker.start()
+    assert started.wait(2)
+    materializer.delete(IDS["workspace"])
+    worker.join(2)
+    assert not (tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
 
 
 def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
