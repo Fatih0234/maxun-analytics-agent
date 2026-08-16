@@ -145,6 +145,7 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
         "c_003_8801b486",
     ]
     database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    assert database.stat().st_mode & 0o777 == 0o600
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute(
             'select "Price", "_source", "_source_order" from data'

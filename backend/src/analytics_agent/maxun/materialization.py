@@ -636,6 +636,7 @@ class Materializer:
             connection.execute("CHECKPOINT")
         finally:
             connection.close()
+        path.chmod(0o600)
         with duckdb.connect(str(path), read_only=True) as check:
             found = _manifest(check)
             if not found or found.get("input_digest") != digest:
