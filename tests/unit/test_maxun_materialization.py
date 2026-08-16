@@ -70,6 +70,13 @@ def payload(columns=None, rows=None, *, source_order=0):
     }
 
 
+def test_per_projection_limits_reject_before_materialization(monkeypatch):
+    monkeypatch.setattr(materialization_module, "MAX_PROJECTION_COLUMNS", 1)
+    with pytest.raises(MaterializationError) as error:
+        MaterializationRequest.model_validate(payload())
+    assert error.value.code == "MATERIALIZATION_LIMIT_EXCEEDED"
+
+
 def test_aggregate_cell_limit_rejects_before_materialization(monkeypatch):
     monkeypatch.setattr(materialization_module, "MAX_CELLS", 3)
     with pytest.raises(MaterializationError) as error:
