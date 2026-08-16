@@ -273,6 +273,23 @@ def test_untrusted_metadata_cannot_change_materialization_path(tmp_path: Path):
     ) == [("v1", IDS["workspace"], "workspace.duckdb")]
 
 
+def test_different_workspaces_are_isolated(tmp_path: Path):
+    first_body = payload()
+    second_body = payload()
+    second_body["workspace"]["id"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    second_body["workspace"]["dataSignature"] = "b" * 64
+    materializer = Materializer(tmp_path)
+    materializer.materialize(MaterializationRequest.model_validate(first_body))
+    materializer.materialize(MaterializationRequest.model_validate(second_body))
+    databases = sorted(
+        path.relative_to(tmp_path).parts for path in tmp_path.rglob("workspace.duckdb")
+    )
+    assert databases == [
+        ("v1", IDS["workspace"], "workspace.duckdb"),
+        ("v1", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "workspace.duckdb"),
+    ]
+
+
 def test_failed_build_does_not_publish_partial_final_file(tmp_path: Path, monkeypatch):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
