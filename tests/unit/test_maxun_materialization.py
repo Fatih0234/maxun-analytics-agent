@@ -155,6 +155,19 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
     assert not database.exists()
 
 
+def test_empty_sources_preserve_schema_and_manifests(tmp_path: Path):
+    body = payload()
+    body["sources"][0]["projection"]["rows"] = []
+    request = MaterializationRequest.model_validate(body)
+    result = Materializer(tmp_path).materialize(request)
+    assert result["rowCount"] == 0
+    assert len(result["schema"]) == 4
+    database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select count(*) from data").fetchone() == (0,)
+        assert connection.execute("select row_count from __maxun_sources").fetchone() == (0,)
+
+
 def test_supported_types_and_typed_blanks_are_materialized(tmp_path: Path):
     columns = ["Integer", "Flag", "Day", "Moment", "Payload", "Text", "Broken"]
     rows = [
