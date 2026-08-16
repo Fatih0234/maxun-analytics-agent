@@ -23,7 +23,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MAX_SOURCES = 100
 MAX_ROWS = 50_000
-MAX_CELLS = 5_000_000
+# The measured safe Phase 3 envelope is one million cells. Larger shapes can be
+# revisited with a streaming transport instead of increasing in-memory JSON caps.
+MAX_CELLS = 1_000_000
 MAX_CELL_BYTES = 1_048_576
 MAX_REQUEST_BYTES = 128 * 1024 * 1024
 RESERVED_COLUMNS = {

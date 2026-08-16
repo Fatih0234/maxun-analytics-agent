@@ -7,6 +7,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from analytics_agent.api import maxun_materialization as maxun_api
+from analytics_agent.maxun import materialization as materialization_module
 from analytics_agent.maxun.materialization import (
     MaterializationError,
     MaterializationRequest,
@@ -64,6 +65,13 @@ def payload(columns=None, rows=None, *, source_order=0):
             }
         ],
     }
+
+
+def test_aggregate_cell_limit_rejects_before_materialization(monkeypatch):
+    monkeypatch.setattr(materialization_module, "MAX_CELLS", 3)
+    with pytest.raises(MaterializationError) as error:
+        MaterializationRequest.model_validate(payload())
+    assert error.value.code == "MATERIALIZATION_LIMIT_EXCEEDED"
 
 
 def test_exact_row_keys_and_non_finite_values_are_rejected():
