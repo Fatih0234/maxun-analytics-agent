@@ -77,6 +77,12 @@ def test_aggregate_cell_limit_rejects_before_materialization(monkeypatch):
     assert error.value.code == "MATERIALIZATION_LIMIT_EXCEEDED"
 
 
+def test_duplicate_columns_are_rejected():
+    body = payload(columns=["A", "A"], rows=[{"A": "x"}])
+    with pytest.raises(ValidationError):
+        MaterializationRequest.model_validate(body)
+
+
 def test_exact_row_keys_and_non_finite_values_are_rejected():
     body = payload(rows=[{"Price": "1.2"}])
     with pytest.raises(ValidationError):
@@ -241,6 +247,20 @@ def test_supported_types_and_typed_blanks_are_materialized(tmp_path: Path):
     assert values[1][4:] == (None, "x", "oops")
 
 
+def test_malformed_date_and_boolean_fallbacks_preserve_original_text(tmp_path: Path):
+    columns = ["Day", "Flag"]
+    rows = [{"Day": "2026-01-01", "Flag": "true"}, {"Day": "bad", "Flag": "0"}]
+    body = payload(columns=columns, rows=rows)
+    body["workspace"]["dataFormatSnapshot"]["columns"] = [
+        {"name": "Day", "type": "date"},
+        {"name": "Flag", "type": "boolean"},
+    ]
+    result = Materializer(tmp_path).materialize(MaterializationRequest.model_validate(body))
+    by_name = {item["logicalName"]: item for item in result["schema"]}
+    assert by_name["Day"]["duckdbType"] == "VARCHAR"
+    assert by_name["Flag"]["duckdbType"] == "VARCHAR"
+
+
 def test_overflow_and_mixed_timestamp_fallbacks_preserve_original_text(tmp_path: Path):
     columns = ["Large", "Naive", "Mixed"]
     rows = [
@@ -279,6 +299,19 @@ def test_unusual_sql_identifiers_are_quoted_and_queryable(tmp_path: Path):
             'SELECT "SELECT", "Product Name", "a""b", "Prüfung", "123abc" FROM data'
         ).fetchone()
     assert result == tuple(row[column] for column in columns)
+
+
+def test_internal_namespace_identifier_is_mapped_without_replacing_manifest(tmp_path: Path):
+    columns = ["__maxun_manifest"]
+    result = Materializer(tmp_path).materialize(
+        MaterializationRequest.model_validate(
+            payload(columns=columns, rows=[{columns[0]: "customer"}])
+        )
+    )
+    assert result["schema"][0]["physicalName"].startswith("c_000_")
+    database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select count(*) from __maxun_manifest").fetchone() == (1,)
 
 
 def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
