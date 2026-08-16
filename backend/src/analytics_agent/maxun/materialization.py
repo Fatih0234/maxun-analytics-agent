@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -466,6 +467,13 @@ class Materializer:
             / "materializations"
         )
         self.root = Path(root or configured_root or default_root)
+        try:
+            concurrency = int(os.environ.get("MAXUN_MATERIALIZATION_CONCURRENCY", "2"))
+        except ValueError as exc:
+            raise ValueError("MAXUN_MATERIALIZATION_CONCURRENCY must be an integer") from exc
+        if not 1 <= concurrency <= 16:
+            raise ValueError("MAXUN_MATERIALIZATION_CONCURRENCY must be between 1 and 16")
+        self._semaphore = threading.BoundedSemaphore(concurrency)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
 
@@ -485,7 +493,7 @@ class Materializer:
         directory, final, lock_path = self._paths(request.workspace.id)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.chmod(0o700)
-        with _lock(lock_path):
+        with self._semaphore, _lock(lock_path):
             if final.exists():
                 try:
                     with duckdb.connect(str(final), read_only=True) as existing:
