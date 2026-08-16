@@ -31,18 +31,33 @@ def payload(columns=None, rows=None, *, source_order=0):
     return {
         "contractVersion": 1,
         "workspace": {
-            "id": IDS["workspace"], "version": 1, "dataSignature": "a" * 64,
+            "id": IDS["workspace"],
+            "version": 1,
+            "dataSignature": "a" * 64,
             "dataFormatId": IDS["format"],
-            "dataFormatSnapshot": {"id": IDS["format"], "name": "Catalog", "columns": [{"name": "Price", "type": "number"}]},
+            "dataFormatSnapshot": {
+                "id": IDS["format"],
+                "name": "Catalog",
+                "columns": [{"name": "Price", "type": "number"}],
+            },
         },
-        "sources": [{
-            "workspaceSourceId": IDS["source"], "sourceOrder": source_order,
-            "projectionId": IDS["projection"], "runId": IDS["run"], "robotId": IDS["robot"],
-            "mappingId": IDS["mapping"], "dataFormatId": IDS["format"],
-            "sourceDatasetKey": "products", "sourceSchemaSignature": "schema",
-            "displayName": "Catalog", "role": "own_catalog", "capturedAt": "2026-08-15T10:01:00+00:00",
-            "projection": {"columns": columns, "rows": rows},
-        }],
+        "sources": [
+            {
+                "workspaceSourceId": IDS["source"],
+                "sourceOrder": source_order,
+                "projectionId": IDS["projection"],
+                "runId": IDS["run"],
+                "robotId": IDS["robot"],
+                "mappingId": IDS["mapping"],
+                "dataFormatId": IDS["format"],
+                "sourceDatasetKey": "products",
+                "sourceSchemaSignature": "schema",
+                "displayName": "Catalog",
+                "role": "own_catalog",
+                "capturedAt": "2026-08-15T10:01:00+00:00",
+                "projection": {"columns": columns, "rows": rows},
+            }
+        ],
     }
 
 
@@ -50,7 +65,14 @@ def test_exact_row_keys_and_non_finite_values_are_rejected():
     body = payload(rows=[{"Price": "1.2"}])
     with pytest.raises(ValidationError):
         MaterializationRequest.model_validate(body)
-    body = payload(rows=[{column: float("nan") if column == "Price" else column for column in ["Price", "_source", "Name", "name"]}])
+    body = payload(
+        rows=[
+            {
+                column: float("nan") if column == "Price" else column
+                for column in ["Price", "_source", "Name", "name"]
+            }
+        ]
+    )
     with pytest.raises(ValidationError):
         MaterializationRequest.model_validate(body)
 
@@ -58,8 +80,17 @@ def test_exact_row_keys_and_non_finite_values_are_rejected():
 def test_schema_skew_is_rejected():
     body = payload()
     second = dict(body["sources"][0])
-    second.update({"workspaceSourceId": "88888888-8888-4888-8888-888888888888", "projectionId": "99999999-9999-4999-8999-999999999999", "sourceOrder": 1})
-    second["projection"] = {"columns": ["Price", "Other", "Name", "name"], "rows": [{"Price": "1", "Other": "x", "Name": "x", "name": "y"}]}
+    second.update(
+        {
+            "workspaceSourceId": "88888888-8888-4888-8888-888888888888",
+            "projectionId": "99999999-9999-4999-8999-999999999999",
+            "sourceOrder": 1,
+        }
+    )
+    second["projection"] = {
+        "columns": ["Price", "Other", "Name", "name"],
+        "rows": [{"Price": "1", "Other": "x", "Name": "x", "name": "y"}],
+    }
     body["sources"].append(second)
     with pytest.raises(MaterializationError) as error:
         MaterializationRequest.model_validate(body)
@@ -73,10 +104,17 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
     second = materializer.materialize(request)
     assert first == second
     assert first["rowCount"] == 1
-    assert [item["physicalName"] for item in first["schema"]] == ["Price", "c_001_3e0763ca", "Name", "c_003_8801b486"]
+    assert [item["physicalName"] for item in first["schema"]] == [
+        "Price",
+        "c_001_3e0763ca",
+        "Name",
+        "c_003_8801b486",
+    ]
     database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
     with duckdb.connect(str(database), read_only=True) as connection:
-        assert connection.execute('select "Price", "_source", "_source_order" from data').fetchone() == (1.25, "Catalog", 0)
+        assert connection.execute(
+            'select "Price", "_source", "_source_order" from data'
+        ).fetchone() == (1.25, "Catalog", 0)
         assert connection.execute("select count(*) from __maxun_manifest").fetchone() == (1,)
     materializer.delete(IDS["workspace"])
     assert not database.exists()
@@ -84,7 +122,9 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
 
 def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
     columns = ["unsafe\x00name"]
-    request = MaterializationRequest.model_validate(payload(columns=columns, rows=[{columns[0]: "value"}]))
+    request = MaterializationRequest.model_validate(
+        payload(columns=columns, rows=[{columns[0]: "value"}])
+    )
     result = Materializer(tmp_path).materialize(request)
     assert result["schema"][0]["physicalName"].startswith("c_000_")
 
@@ -92,14 +132,23 @@ def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
 def test_digest_ignores_json_object_key_order():
     left = payload(rows=[{"Price": "1", "_source": {"b": 2, "a": 1}, "Name": "x", "name": "y"}])
     right = payload(rows=[{"Price": "1", "_source": {"a": 1, "b": 2}, "Name": "x", "name": "y"}])
-    assert input_digest(MaterializationRequest.model_validate(left)) == input_digest(MaterializationRequest.model_validate(right))
+    assert input_digest(MaterializationRequest.model_validate(left)) == input_digest(
+        MaterializationRequest.model_validate(right)
+    )
 
 
 def test_integrity_conflict_is_rejected(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
     materializer.materialize(request)
-    changed = payload(rows=[{column: ("2.5" if column == "Price" else column) for column in ["Price", "_source", "Name", "name"]}])
+    changed = payload(
+        rows=[
+            {
+                column: ("2.5" if column == "Price" else column)
+                for column in ["Price", "_source", "Name", "name"]
+            }
+        ]
+    )
     with pytest.raises(MaterializationError) as error:
         materializer.materialize(MaterializationRequest.model_validate(changed))
     assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
@@ -108,7 +157,11 @@ def test_integrity_conflict_is_rejected(tmp_path: Path):
 def test_duckdb_external_access_and_extensions_are_disabled():
     connection = duckdb.connect(":memory:")
     _settings(connection)
-    for statement in ("ATTACH '/tmp/external.db' AS external_db", "LOAD httpfs", "SELECT * FROM read_csv('/etc/passwd')"):
+    for statement in (
+        "ATTACH '/tmp/external.db' AS external_db",
+        "LOAD httpfs",
+        "SELECT * FROM read_csv('/etc/passwd')",
+    ):
         with pytest.raises(duckdb.Error):
             connection.execute(statement)
     connection.close()

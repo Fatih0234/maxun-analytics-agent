@@ -25,16 +25,29 @@ MAX_CELLS = 5_000_000
 MAX_CELL_BYTES = 1_048_576
 MAX_REQUEST_BYTES = 128 * 1024 * 1024
 RESERVED_COLUMNS = {
-    "_source", "_source_role", "_captured_at", "_captured_at_ts", "_run_id",
-    "_robot_id", "_mapping_id", "_projection_id", "_source_dataset_key",
-    "_workspace_source_id", "_source_order",
+    "_source",
+    "_source_role",
+    "_captured_at",
+    "_captured_at_ts",
+    "_run_id",
+    "_robot_id",
+    "_mapping_id",
+    "_projection_id",
+    "_source_dataset_key",
+    "_workspace_source_id",
+    "_source_order",
 }
 SYSTEM_COLUMNS = [
-    ("_source", "VARCHAR"), ("_source_role", "VARCHAR"),
-    ("_captured_at", "VARCHAR"), ("_captured_at_ts", "TIMESTAMPTZ"),
-    ("_run_id", "VARCHAR"), ("_robot_id", "VARCHAR"),
-    ("_mapping_id", "VARCHAR"), ("_projection_id", "VARCHAR"),
-    ("_source_dataset_key", "VARCHAR"), ("_workspace_source_id", "VARCHAR"),
+    ("_source", "VARCHAR"),
+    ("_source_role", "VARCHAR"),
+    ("_captured_at", "VARCHAR"),
+    ("_captured_at_ts", "TIMESTAMPTZ"),
+    ("_run_id", "VARCHAR"),
+    ("_robot_id", "VARCHAR"),
+    ("_mapping_id", "VARCHAR"),
+    ("_projection_id", "VARCHAR"),
+    ("_source_dataset_key", "VARCHAR"),
+    ("_workspace_source_id", "VARCHAR"),
     ("_source_order", "INTEGER"),
 ]
 
@@ -122,8 +135,14 @@ class MaterializationRequest(BaseModel):
         expected_columns: list[str] | None = None
         rows = cells = 0
         for source in sorted(self.sources, key=lambda item: item.sourceOrder):
-            for value in (source.workspaceSourceId, source.projectionId, source.runId,
-                          source.robotId, source.mappingId, source.dataFormatId):
+            for value in (
+                source.workspaceSourceId,
+                source.projectionId,
+                source.runId,
+                source.robotId,
+                source.mappingId,
+                source.dataFormatId,
+            ):
                 _uuid(value)
             if source.dataFormatId != self.workspace.dataFormatId:
                 raise ValueError("source data format mismatch")
@@ -131,7 +150,9 @@ class MaterializationRequest(BaseModel):
             if expected_columns is None:
                 expected_columns = columns
             elif columns != expected_columns:
-                raise MaterializationError("MATERIALIZATION_SCHEMA_MISMATCH", "source schemas differ", 409)
+                raise MaterializationError(
+                    "MATERIALIZATION_SCHEMA_MISMATCH", "source schemas differ", 409
+                )
             for row in source.projection.rows:
                 if set(row) != set(columns):
                     raise ValueError("row keys do not match columns")
@@ -139,7 +160,9 @@ class MaterializationRequest(BaseModel):
             rows += len(source.projection.rows)
             cells += len(source.projection.rows) * len(columns)
         if rows > MAX_ROWS or cells > MAX_CELLS:
-            raise MaterializationError("MATERIALIZATION_LIMIT_EXCEEDED", "materialization limits exceeded", 413)
+            raise MaterializationError(
+                "MATERIALIZATION_LIMIT_EXCEEDED", "materialization limits exceeded", 413
+            )
         return self
 
 
@@ -162,30 +185,41 @@ def _reject_nonfinite(value: Any) -> None:
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
 
 
 def input_digest(request: MaterializationRequest) -> str:
     sources = []
     for source in sorted(request.sources, key=lambda item: item.sourceOrder):
-        rows = [{column: row[column] for column in source.projection.columns} for row in source.projection.rows]
-        sources.append({
-            "workspaceSourceId": source.workspaceSourceId,
-            "sourceOrder": source.sourceOrder,
-            "projectionId": source.projectionId,
-            "runId": source.runId,
-            "robotId": source.robotId,
-            "mappingId": source.mappingId,
-            "dataFormatId": source.dataFormatId,
-            "sourceDatasetKey": source.sourceDatasetKey,
-            "sourceSchemaSignature": source.sourceSchemaSignature,
-            "displayName": source.displayName,
-            "role": source.role,
-            "capturedAt": source.capturedAt,
-            "columns": source.projection.columns,
-            "rows": rows,
-        })
-    payload = {"contractVersion": request.contractVersion, "workspace": request.workspace.model_dump(), "sources": sources}
+        rows = [
+            {column: row[column] for column in source.projection.columns}
+            for row in source.projection.rows
+        ]
+        sources.append(
+            {
+                "workspaceSourceId": source.workspaceSourceId,
+                "sourceOrder": source.sourceOrder,
+                "projectionId": source.projectionId,
+                "runId": source.runId,
+                "robotId": source.robotId,
+                "mappingId": source.mappingId,
+                "dataFormatId": source.dataFormatId,
+                "sourceDatasetKey": source.sourceDatasetKey,
+                "sourceSchemaSignature": source.sourceSchemaSignature,
+                "displayName": source.displayName,
+                "role": source.role,
+                "capturedAt": source.capturedAt,
+                "columns": source.projection.columns,
+                "rows": rows,
+            }
+        )
+    payload = {
+        "contractVersion": request.contractVersion,
+        "workspace": request.workspace.model_dump(),
+        "sources": sources,
+    }
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
@@ -238,12 +272,23 @@ def _parse_date(value: Any) -> date | None:
 
 def _type_and_rule(values: list[Any], hint: str) -> tuple[str, str]:
     nonnull = [value for value in values if value is not None and value != ""]
-    if hint in {"text", "currency", "distance", "url", "image_url", "country", "status", "condition"}:
+    if hint in {
+        "text",
+        "currency",
+        "distance",
+        "url",
+        "image_url",
+        "country",
+        "status",
+        "condition",
+    }:
         return "VARCHAR", "text"
     if hint in {"number", "numeric", "float", "decimal", "price"}:
         try:
             nums = [_strict_number(value) for value in nonnull]
-            if all(n is not None and n == n.to_integral_value() and -(2**63) <= n < 2**63 for n in nums):
+            if all(
+                n is not None and n == n.to_integral_value() and -(2**63) <= n < 2**63 for n in nums
+            ):
                 return "BIGINT", "strict-number"
             if all(n is not None for n in nums):
                 return "DOUBLE", "strict-number"
@@ -251,11 +296,21 @@ def _type_and_rule(values: list[Any], hint: str) -> tuple[str, str]:
             pass
         return "VARCHAR", "number-fallback-varchar"
     if hint == "year":
-        if all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9999 or isinstance(v, str) and re.fullmatch(r"\d{4}", v) for v in nonnull):
+        if all(
+            isinstance(v, int)
+            and not isinstance(v, bool)
+            and 0 <= v <= 9999
+            or isinstance(v, str)
+            and re.fullmatch(r"\d{4}", v)
+            for v in nonnull
+        ):
             return "BIGINT", "year"
         return "VARCHAR", "year-fallback-varchar"
     if hint in {"boolean", "bool"}:
-        if all(isinstance(v, bool) or isinstance(v, str) and v.lower() in {"true", "false"} for v in nonnull):
+        if all(
+            isinstance(v, bool) or isinstance(v, str) and v.lower() in {"true", "false"}
+            for v in nonnull
+        ):
             return "BOOLEAN", "strict-boolean"
         return "VARCHAR", "boolean-fallback-varchar"
     if hint in {"date"}:
@@ -268,14 +323,21 @@ def _type_and_rule(values: list[Any], hint: str) -> tuple[str, str]:
         try:
             parsed = [_parse_timestamp(v) for v in nonnull]
             aware = [v.tzinfo is not None for v in parsed if v is not None]
-            return ("TIMESTAMPTZ" if all(aware) else "TIMESTAMP" if not any(aware) else "VARCHAR"), "strict-timestamp"
+            return (
+                "TIMESTAMPTZ" if all(aware) else "TIMESTAMP" if not any(aware) else "VARCHAR"
+            ), "strict-timestamp"
         except (ValueError, TypeError):
             return "VARCHAR", "timestamp-fallback-varchar"
     if nonnull and all(isinstance(v, bool) for v in nonnull):
         return "BOOLEAN", "inferred-boolean"
-    if nonnull and all(isinstance(v, int) and not isinstance(v, bool) and -(2**63) <= v < 2**63 for v in nonnull):
+    if nonnull and all(
+        isinstance(v, int) and not isinstance(v, bool) and -(2**63) <= v < 2**63 for v in nonnull
+    ):
         return "BIGINT", "inferred-integer"
-    if nonnull and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in nonnull):
+    if nonnull and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+        for v in nonnull
+    ):
         return "DOUBLE", "inferred-number"
     return "VARCHAR", "text"
 
@@ -312,7 +374,13 @@ def _convert(value: Any, dtype: str, rule: str) -> Any:
         return _parse_date(value)
     if dtype in {"TIMESTAMP", "TIMESTAMPTZ"}:
         parsed = _parse_timestamp(value)
-        if parsed is None or dtype == "TIMESTAMP" and parsed.tzinfo is not None or dtype == "TIMESTAMPTZ" and parsed.tzinfo is None:
+        if (
+            parsed is None
+            or dtype == "TIMESTAMP"
+            and parsed.tzinfo is not None
+            or dtype == "TIMESTAMPTZ"
+            and parsed.tzinfo is None
+        ):
             raise ValueError
         return parsed
     raise ValueError
@@ -322,14 +390,20 @@ def _physical_names(columns: list[str]) -> list[tuple[str, str, bool]]:
     seen: set[str] = set()
     result = []
     for ordinal, logical in enumerate(columns):
-        collision = logical in RESERVED_COLUMNS or logical.lower().startswith("__maxun_") or logical.lower() in seen
+        collision = (
+            logical in RESERVED_COLUMNS
+            or logical.lower().startswith("__maxun_")
+            or logical.lower() in seen
+        )
         if collision or "\x00" in logical:
             suffix = hashlib.sha256(f"{ordinal}:{logical}".encode()).hexdigest()[:8]
             physical, mapped = f"c_{ordinal:03d}_{suffix}", True
         else:
             physical, mapped = logical, False
         if physical.lower() in seen:
-            raise MaterializationError("MATERIALIZATION_INVALID_CONTRACT", "ambiguous customer identifier")
+            raise MaterializationError(
+                "MATERIALIZATION_INVALID_CONTRACT", "ambiguous customer identifier"
+            )
         seen.add(physical.lower())
         result.append((logical, physical, mapped))
     return result
@@ -342,6 +416,7 @@ def _quote(identifier: str) -> str:
 @contextmanager
 def _lock(path: Path) -> Iterator[None]:
     import fcntl
+
     path.touch(mode=0o600, exist_ok=True)
     with path.open("r+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -379,7 +454,12 @@ def _manifest(connection: duckdb.DuckDBPyConnection) -> dict[str, Any] | None:
 class Materializer:
     def __init__(self, root: str | Path | None = None):
         configured_root = os.environ.get("MAXUN_MATERIALIZATION_ROOT", "").strip()
-        default_root = Path(os.environ.get("ANALYTICS_AGENT_CONFIG_DIR", "~/.datahub/analytics-agent")).expanduser() / "materializations"
+        default_root = (
+            Path(
+                os.environ.get("ANALYTICS_AGENT_CONFIG_DIR", "~/.datahub/analytics-agent")
+            ).expanduser()
+            / "materializations"
+        )
         self.root = Path(root or configured_root or default_root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -388,9 +468,13 @@ class Materializer:
         directory = self.root / "v1" / workspace
         return directory, directory / "workspace.duckdb", directory / "workspace.lock"
 
-    def materialize(self, request: MaterializationRequest, request_bytes: int | None = None) -> dict[str, Any]:
+    def materialize(
+        self, request: MaterializationRequest, request_bytes: int | None = None
+    ) -> dict[str, Any]:
         if request_bytes is not None and request_bytes > MAX_REQUEST_BYTES:
-            raise MaterializationError("MATERIALIZATION_LIMIT_EXCEEDED", "request is too large", 413)
+            raise MaterializationError(
+                "MATERIALIZATION_LIMIT_EXCEEDED", "request is too large", 413
+            )
         digest = input_digest(request)
         directory, final, lock_path = self._paths(request.workspace.id)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -402,7 +486,11 @@ class Materializer:
                         if found and found.get("input_digest") == digest:
                             return self._response(request, digest, found, existing)
                         if found and found.get("data_signature") == request.workspace.dataSignature:
-                            raise MaterializationError("MATERIALIZATION_INTEGRITY_MISMATCH", "materialization input changed", 409)
+                            raise MaterializationError(
+                                "MATERIALIZATION_INTEGRITY_MISMATCH",
+                                "materialization input changed",
+                                409,
+                            )
                 except MaterializationError:
                     raise
                 except Exception:
@@ -419,10 +507,19 @@ class Materializer:
     def _build(self, request: MaterializationRequest, digest: str, path: Path) -> dict[str, Any]:
         columns = request.sources[0].projection.columns
         physical = _physical_names(columns)
-        all_values = [[source.projection.rows[i].get(column) for source in request.sources for i in range(len(source.projection.rows))] for column in columns]
+        all_values = [
+            [
+                source.projection.rows[i].get(column)
+                for source in request.sources
+                for i in range(len(source.projection.rows))
+            ]
+            for column in columns
+        ]
         specs = []
         for ordinal, (logical, name, mapped) in enumerate(physical):
-            dtype, rule = _type_and_rule(all_values[ordinal], _hint(request.workspace.dataFormatSnapshot, logical))
+            dtype, rule = _type_and_rule(
+                all_values[ordinal], _hint(request.workspace.dataFormatSnapshot, logical)
+            )
             if dtype != "VARCHAR":
                 try:
                     for value in all_values[ordinal]:
@@ -436,14 +533,35 @@ class Materializer:
             connection.execute("BEGIN TRANSACTION")
             customer_ddl = ", ".join(f"{_quote(name)} {dtype}" for _, _, name, dtype, _, _ in specs)
             system_ddl = ", ".join(f"{_quote(name)} {dtype}" for name, dtype in SYSTEM_COLUMNS)
-            connection.execute(f"CREATE TABLE data ({customer_ddl + ', ' if customer_ddl else ''}{system_ddl})")
-            connection.execute("CREATE TABLE __maxun_manifest (contract_version INTEGER, materialization_version INTEGER, workspace_id VARCHAR, workspace_version INTEGER, data_signature VARCHAR, input_digest VARCHAR, relation_name VARCHAR, source_count INTEGER, row_count INTEGER, column_count INTEGER, duckdb_version VARCHAR)")
-            connection.execute("CREATE TABLE __maxun_sources (workspace_source_id VARCHAR, source_order INTEGER, display_name VARCHAR, role VARCHAR, projection_id VARCHAR, run_id VARCHAR, robot_id VARCHAR, mapping_id VARCHAR, data_format_id VARCHAR, source_dataset_key VARCHAR, source_schema_signature VARCHAR, captured_at VARCHAR, captured_at_ts TIMESTAMPTZ, row_count INTEGER)")
-            connection.execute("CREATE TABLE __maxun_columns (ordinal INTEGER, logical_name VARCHAR, physical_name VARCHAR, declared_type VARCHAR, duckdb_type VARCHAR, conversion_rule VARCHAR, identifier_was_mapped BOOLEAN)")
+            connection.execute(
+                f"CREATE TABLE data ({customer_ddl + ', ' if customer_ddl else ''}{system_ddl})"
+            )
+            connection.execute(
+                "CREATE TABLE __maxun_manifest (contract_version INTEGER, materialization_version INTEGER, workspace_id VARCHAR, workspace_version INTEGER, data_signature VARCHAR, input_digest VARCHAR, relation_name VARCHAR, source_count INTEGER, row_count INTEGER, column_count INTEGER, duckdb_version VARCHAR)"
+            )
+            connection.execute(
+                "CREATE TABLE __maxun_sources (workspace_source_id VARCHAR, source_order INTEGER, display_name VARCHAR, role VARCHAR, projection_id VARCHAR, run_id VARCHAR, robot_id VARCHAR, mapping_id VARCHAR, data_format_id VARCHAR, source_dataset_key VARCHAR, source_schema_signature VARCHAR, captured_at VARCHAR, captured_at_ts TIMESTAMPTZ, row_count INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE __maxun_columns (ordinal INTEGER, logical_name VARCHAR, physical_name VARCHAR, declared_type VARCHAR, duckdb_type VARCHAR, conversion_rule VARCHAR, identifier_was_mapped BOOLEAN)"
+            )
             for spec in specs:
-                connection.execute("INSERT INTO __maxun_columns VALUES (?, ?, ?, ?, ?, ?, ?)", [spec[0], spec[1], spec[2], _hint(request.workspace.dataFormatSnapshot, spec[1]), spec[3], spec[4], spec[5]])
+                connection.execute(
+                    "INSERT INTO __maxun_columns VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        spec[0],
+                        spec[1],
+                        spec[2],
+                        _hint(request.workspace.dataFormatSnapshot, spec[1]),
+                        spec[3],
+                        spec[4],
+                        spec[5],
+                    ],
+                )
             row_count = 0
-            insert_names = [name for _, _, name, _, _, _ in specs] + [name for name, _ in SYSTEM_COLUMNS]
+            insert_names = [name for _, _, name, _, _, _ in specs] + [
+                name for name, _ in SYSTEM_COLUMNS
+            ]
             placeholders = ",".join("?" for _ in insert_names)
             sql = f"INSERT INTO data ({','.join(_quote(name) for name in insert_names)}) VALUES ({placeholders})"
             for source in sorted(request.sources, key=lambda item: item.sourceOrder):
@@ -458,11 +576,58 @@ class Materializer:
                             values.append(_convert(row[spec[1]], spec[3], spec[4]))
                         except (ValueError, TypeError):
                             values.append(_json_text(row[spec[1]]))
-                    values.extend([source.displayName, source.role, source.capturedAt, captured, source.runId, source.robotId, source.mappingId, source.projectionId, source.sourceDatasetKey, source.workspaceSourceId, source.sourceOrder])
+                    values.extend(
+                        [
+                            source.displayName,
+                            source.role,
+                            source.capturedAt,
+                            captured,
+                            source.runId,
+                            source.robotId,
+                            source.mappingId,
+                            source.projectionId,
+                            source.sourceDatasetKey,
+                            source.workspaceSourceId,
+                            source.sourceOrder,
+                        ]
+                    )
                     connection.execute(sql, values)
                     row_count += 1
-                connection.execute("INSERT INTO __maxun_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [source.workspaceSourceId, source.sourceOrder, source.displayName, source.role, source.projectionId, source.runId, source.robotId, source.mappingId, source.dataFormatId, source.sourceDatasetKey, source.sourceSchemaSignature, source.capturedAt, captured, len(source.projection.rows)])
-            connection.execute("INSERT INTO __maxun_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [1, 1, request.workspace.id, request.workspace.version, request.workspace.dataSignature, digest, "data", len(request.sources), row_count, len(specs), duckdb.__version__])
+                connection.execute(
+                    "INSERT INTO __maxun_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        source.workspaceSourceId,
+                        source.sourceOrder,
+                        source.displayName,
+                        source.role,
+                        source.projectionId,
+                        source.runId,
+                        source.robotId,
+                        source.mappingId,
+                        source.dataFormatId,
+                        source.sourceDatasetKey,
+                        source.sourceSchemaSignature,
+                        source.capturedAt,
+                        captured,
+                        len(source.projection.rows),
+                    ],
+                )
+            connection.execute(
+                "INSERT INTO __maxun_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    1,
+                    1,
+                    request.workspace.id,
+                    request.workspace.version,
+                    request.workspace.dataSignature,
+                    digest,
+                    "data",
+                    len(request.sources),
+                    row_count,
+                    len(specs),
+                    duckdb.__version__,
+                ],
+            )
             connection.execute("COMMIT")
             connection.execute("CHECKPOINT")
         finally:
@@ -470,12 +635,41 @@ class Materializer:
         with duckdb.connect(str(path), read_only=True) as check:
             found = _manifest(check)
             if not found or found.get("input_digest") != digest:
-                raise MaterializationError("MATERIALIZATION_UNAVAILABLE", "materialization verification failed", 503)
+                raise MaterializationError(
+                    "MATERIALIZATION_UNAVAILABLE", "materialization verification failed", 503
+                )
             return self._response(request, digest, found, check)
 
-    def _response(self, request: MaterializationRequest, digest: str, found: dict[str, Any], connection: duckdb.DuckDBPyConnection) -> dict[str, Any]:
-        schema = [{"logicalName": row[1], "physicalName": row[2], "duckdbType": row[4], "conversion": row[5]} for row in connection.execute("SELECT * FROM __maxun_columns ORDER BY ordinal").fetchall()]
-        return {"contractVersion": 1, "materializationVersion": 1, "workspaceId": request.workspace.id, "dataSignature": request.workspace.dataSignature, "inputDigest": digest, "state": "ready", "relation": "data", "sourceCount": found["source_count"], "rowCount": found["row_count"], "schema": schema}
+    def _response(
+        self,
+        request: MaterializationRequest,
+        digest: str,
+        found: dict[str, Any],
+        connection: duckdb.DuckDBPyConnection,
+    ) -> dict[str, Any]:
+        schema = [
+            {
+                "logicalName": row[1],
+                "physicalName": row[2],
+                "duckdbType": row[4],
+                "conversion": row[5],
+            }
+            for row in connection.execute(
+                "SELECT * FROM __maxun_columns ORDER BY ordinal"
+            ).fetchall()
+        ]
+        return {
+            "contractVersion": 1,
+            "materializationVersion": 1,
+            "workspaceId": request.workspace.id,
+            "dataSignature": request.workspace.dataSignature,
+            "inputDigest": digest,
+            "state": "ready",
+            "relation": "data",
+            "sourceCount": found["source_count"],
+            "rowCount": found["row_count"],
+            "schema": schema,
+        }
 
     def delete(self, workspace_id: str) -> None:
         directory, _, lock_path = self._paths(workspace_id)
@@ -483,15 +677,27 @@ class Materializer:
             return
         with _lock(lock_path):
             if directory.resolve().parent != (self.root / "v1").resolve():
-                raise MaterializationError("MATERIALIZATION_INVALID_CONTRACT", "invalid materialization path")
+                raise MaterializationError(
+                    "MATERIALIZATION_INVALID_CONTRACT", "invalid materialization path"
+                )
             shutil.rmtree(directory)
 
 
 def configured_token() -> str:
-    return os.environ.get("MAXUN_ANALYTICS_INTERNAL_TOKEN", "").strip() or os.environ.get("ANALYTICS_AGENT_INTERNAL_TOKEN", "").strip()
+    return (
+        os.environ.get("MAXUN_ANALYTICS_INTERNAL_TOKEN", "").strip()
+        or os.environ.get("ANALYTICS_AGENT_INTERNAL_TOKEN", "").strip()
+    )
 
 
 def authorize_token(value: str | None) -> None:
     expected = configured_token()
-    if not expected or not value or not value.startswith("Bearer ") or not hmac.compare_digest(value[7:].strip(), expected):
-        raise MaterializationError("MATERIALIZATION_UNAVAILABLE", "materialization service unavailable", 503)
+    if (
+        not expected
+        or not value
+        or not value.startswith("Bearer ")
+        or not hmac.compare_digest(value[7:].strip(), expected)
+    ):
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization service unavailable", 503
+        )
