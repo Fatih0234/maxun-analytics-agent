@@ -5,7 +5,14 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from analytics_agent.api import chat, connectors, conversations, maxun_materialization, oauth, settings
+from analytics_agent.api import (
+    chat,
+    connectors,
+    conversations,
+    maxun_materialization,
+    oauth,
+    settings,
+)
 
 api_router = APIRouter()
 api_router.include_router(conversations.router)
