@@ -46,6 +46,7 @@ dependencies = [
     # Query engines (SQLAlchemy-based; heavy native connectors are separate packages)
     "pymysql>=1.1.0",
     "duckdb==1.5.2",
+    "pytz>=2024.1",
     "duckdb-engine>=0.13.0",
     # Observability (OTEL) — no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
     "opentelemetry-sdk>=1.25.0",

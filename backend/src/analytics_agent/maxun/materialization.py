@@ -464,6 +464,7 @@ def _settings(connection: duckdb.DuckDBPyConnection) -> None:
         "SET threads = 2",
         "SET memory_limit = '512MB'",
         "SET max_temp_directory_size = '1GB'",
+        "SET TimeZone = 'UTC'",
     ):
         connection.execute(statement)
     connection.execute("SET lock_configuration = true")
