@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 from threading import Event, Thread
 
@@ -229,6 +230,15 @@ def test_supported_types_and_typed_blanks_are_materialized(tmp_path: Path):
     assert by_name["Moment"]["duckdbType"] == "TIMESTAMPTZ"
     assert by_name["Payload"]["duckdbType"] == "VARCHAR"
     assert by_name["Broken"]["duckdbType"] == "VARCHAR"
+    database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        values = connection.execute(
+            'SELECT "Integer", "Flag", "Day", "Moment", "Payload", "Text", "Broken" FROM data ORDER BY "Integer" DESC NULLS LAST'
+        ).fetchall()
+    assert values[0][0:3] == (7, True, date(2026, 1, 1))
+    assert values[0][4:] == ('{"a":1,"b":2}', "", "1")
+    assert values[1][0:3] == (None, False, None)
+    assert values[1][4:] == (None, "x", "oops")
 
 
 def test_overflow_and_mixed_timestamp_fallbacks_preserve_original_text(tmp_path: Path):
