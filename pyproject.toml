@@ -67,6 +67,7 @@ dependencies = [
     # Telemetry
     "mixpanel>=4.10.0",
     "rfc8785==0.1.4",
+    "sqlglot>=26.0.0",
 ]
 
 [project.urls]

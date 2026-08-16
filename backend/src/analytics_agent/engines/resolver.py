@@ -18,18 +18,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = logging.getLogger(__name__)
 
 
-async def resolve_engine(engine_name: str, session: AsyncSession) -> Any:
-    """
-    Load the Integration + its credential from DB and return a
-    request-scoped engine clone configured with the right auth.
+async def resolve_engine(
+    engine_name: str,
+    session: AsyncSession,
+    *,
+    maxun_workspace_signature: str | None = None,
+    maxun_workspace_version: int | None = None,
+) -> Any:
+    """Resolve a configured engine or a request-scoped Maxun workspace engine.
 
-    Priority:
-      1. SSO (externalbrowser) — credential in integration_credentials
-      2. PAT — credential in integration_credentials
-      3. Private key — credential in integration_credentials
-      4. Password — credential in integration_credentials (future)
-      5. Env vars (yaml connections / backwards compat)
+    ``maxun:<uuid>`` is a virtual namespace. It must never be looked up in the
+    global registry or fall back to a configured connector. The optional
+    snapshot metadata is supplied by Maxun's authenticated internal adapter and
+    is checked against the materialization manifest before a query runs.
     """
+    if isinstance(engine_name, str) and engine_name.startswith("maxun:"):
+        from analytics_agent.engines.maxun.engine import MaxunQueryError, MaxunWorkspaceEngine
+
+        if maxun_workspace_signature is None or maxun_workspace_version is None:
+            raise MaxunQueryError("MAXUN_SNAPSHOT_REQUIRED", "Workspace snapshot is unavailable")
+        return MaxunWorkspaceEngine.from_engine_name(
+            engine_name,
+            expected_signature=maxun_workspace_signature,
+            expected_version=maxun_workspace_version,
+        )
+
+    # Configured engine resolution below retains the existing credential
+    # priority and registry behavior for non-Maxun engines.
+    # Priority: SSO, PAT, private key, password, then env vars.
     from analytics_agent.api.oauth import _decrypt
     from analytics_agent.db.repository import CredentialRepo
     from analytics_agent.engines.factory import get_registry
