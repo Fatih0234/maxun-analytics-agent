@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from uuid import UUID
 
 import anyio
@@ -75,8 +76,45 @@ async def materialize_workspace(
         ) from error
 
 
+_MAX_EXACT_JSON_INTEGER = 2**53 - 1
+
+
+def _parse_json_int(token: str) -> int | float:
+    """Decode JSON integers with the ECMAScript Number producer semantics.
+
+    Maxun serializes native JavaScript numbers before sending this request. A
+    value such as ``1e20`` therefore arrives on the wire as the integer token
+    ``100000000000000000000``. Python's default decoder would retain that as
+    an arbitrary-precision ``int``, but JCS models JSON numbers as IEEE-754
+    doubles. Preserve exact safe integers and round larger tokens exactly as
+    the JavaScript producer already did.
+    """
+    value = int(token)
+    if abs(value) <= _MAX_EXACT_JSON_INTEGER:
+        return value
+    try:
+        normalized = float(token)
+    except (OverflowError, ValueError) as error:
+        raise ValueError("JSON number is outside the finite ECMAScript Number domain") from error
+    if not math.isfinite(normalized):
+        raise ValueError("JSON number is outside the finite ECMAScript Number domain")
+    return normalized
+
+
+def _parse_json_float(token: str) -> float:
+    try:
+        normalized = float(token)
+    except (OverflowError, ValueError) as error:
+        raise ValueError("JSON number is invalid") from error
+    if not math.isfinite(normalized):
+        raise ValueError("JSON number is outside the finite ECMAScript Number domain")
+    return normalized
+
+
 def _parse_materialization_request(raw: bytes) -> MaterializationRequest:
-    return MaterializationRequest.model_validate(json.loads(raw))
+    return MaterializationRequest.model_validate(
+        json.loads(raw, parse_int=_parse_json_int, parse_float=_parse_json_float)
+    )
 
 
 @router.delete("/{workspace_id}", status_code=204)

@@ -14,6 +14,7 @@ import duckdb
 import httpx
 import pytest
 from analytics_agent.api import maxun_materialization as maxun_api
+from analytics_agent.api.maxun_materialization import _parse_materialization_request
 from analytics_agent.maxun import materialization as materialization_module
 from analytics_agent.maxun.materialization import (
     MaterializationError,
@@ -382,7 +383,23 @@ def test_shared_jcs_fixture_matches_canonical_bytes_and_sha256():
     )
     fixture = json.loads(fixture_path.read_text())
     for vector in fixture["vectors"]:
-        request = MaterializationRequest.model_validate(vector["request"])
+        request = _parse_materialization_request(vector["wire"].encode())
+        canonical = canonical_materialization_payload(request)
+        assert canonical == vector["canonical"], vector["name"]
+        assert hashlib.sha256(canonical.encode()).hexdigest() == vector["sha256"]
+
+
+def test_wire_jcs_fixture_uses_the_production_json_parser():
+    fixture_path = (
+        Path(__file__).parents[1] / "fixtures" / "maxun_materialization_digest_vectors.json"
+    )
+    fixture = json.loads(fixture_path.read_text())
+    for vector in fixture["vectors"]:
+        request = _parse_materialization_request(vector["wire"].encode())
+        row = request.sources[0].projection.rows[0]
+        assert isinstance(row["large"], float)
+        assert isinstance(row["safeBoundary"], float)
+        assert isinstance(row["doubleLarge"], float)
         canonical = canonical_materialization_payload(request)
         assert canonical == vector["canonical"], vector["name"]
         assert hashlib.sha256(canonical.encode()).hexdigest() == vector["sha256"]
@@ -579,6 +596,30 @@ def test_duckdb_external_access_and_extensions_are_disabled():
         with pytest.raises(duckdb.Error):
             connection.execute(statement)
     connection.close()
+
+
+def test_http_wire_fixture_materializes_through_the_production_parser(tmp_path: Path, monkeypatch):
+    fixture_path = (
+        Path(__file__).parents[1] / "fixtures" / "maxun_materialization_digest_vectors.json"
+    )
+    vector = json.loads(fixture_path.read_text())["vectors"][0]
+    app = FastAPI()
+    app.include_router(maxun_api.router)
+    monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", "internal-secret")
+    monkeypatch.setattr(maxun_api, "_materializer", Materializer(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.put(
+            f"/internal/maxun/materializations/{IDS['workspace']}",
+            headers={
+                "Authorization": "Bearer internal-secret",
+                "Content-Type": "application/json",
+            },
+            content=vector["wire"].encode(),
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["inputDigest"] == vector["sha256"]
 
 
 def test_internal_http_route_enforces_token_and_returns_bounded_response(

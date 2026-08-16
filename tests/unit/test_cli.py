@@ -38,6 +38,27 @@ def test_cli_migrate_creates_schema(sqlite_db, monkeypatch):
     assert {"alembic_version", "integrations", "context_platforms", "settings"} <= tables
 
 
+def test_cli_bootstrap_validates_build_before_database_side_effects(monkeypatch):
+    calls = []
+
+    def reject_build():
+        raise RuntimeError("build mismatch")
+
+    monkeypatch.setattr(cli_module, "validate_build_identity", reject_build)
+    monkeypatch.setattr(
+        cli_module.bootstrap,
+        "run_migrations",
+        lambda: calls.append("migrations"),
+    )
+
+    result = CliRunner().invoke(cli, ["bootstrap"])
+
+    assert result.exit_code != 0
+    assert calls == []
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == "build mismatch"
+
+
 def test_cli_bootstrap_runs_all_steps_idempotent(sqlite_db, monkeypatch):
     _chdir_repo_root(monkeypatch)
 
