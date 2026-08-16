@@ -53,7 +53,7 @@ class Projection(BaseModel):
     @field_validator("columns")
     @classmethod
     def columns_are_strings(cls, value: list[str]) -> list[str]:
-        if any(not isinstance(item, str) or "\x00" in item for item in value):
+        if any(not isinstance(item, str) for item in value):
             raise ValueError("projection columns must be safe strings")
         if len(set(value)) != len(value):
             raise ValueError("duplicate projection column")
@@ -104,6 +104,8 @@ class MaterializationRequest(BaseModel):
     def validate_contract(self) -> MaterializationRequest:
         _uuid(self.workspace.id)
         _uuid(self.workspace.dataFormatId)
+        if self.workspace.dataFormatSnapshot.id != self.workspace.dataFormatId:
+            raise ValueError("data format snapshot mismatch")
         if self.contractVersion != 1 or self.workspace.version < 1:
             raise ValueError("unsupported contract")
         if not re.fullmatch(r"[0-9a-f]{64}", self.workspace.dataSignature):
@@ -445,7 +447,10 @@ class Materializer:
             placeholders = ",".join("?" for _ in insert_names)
             sql = f"INSERT INTO data ({','.join(_quote(name) for name in insert_names)}) VALUES ({placeholders})"
             for source in sorted(request.sources, key=lambda item: item.sourceOrder):
-                captured = _parse_timestamp(source.capturedAt)
+                try:
+                    captured = _parse_timestamp(source.capturedAt)
+                except (ValueError, TypeError):
+                    captured = None
                 for row in source.projection.rows:
                     values = []
                     for spec in specs:

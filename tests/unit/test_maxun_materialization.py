@@ -82,6 +82,13 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
     assert not database.exists()
 
 
+def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
+    columns = ["unsafe\x00name"]
+    request = MaterializationRequest.model_validate(payload(columns=columns, rows=[{columns[0]: "value"}]))
+    result = Materializer(tmp_path).materialize(request)
+    assert result["schema"][0]["physicalName"].startswith("c_000_")
+
+
 def test_digest_ignores_json_object_key_order():
     left = payload(rows=[{"Price": "1", "_source": {"b": 2, "a": 1}, "Name": "x", "name": "y"}])
     right = payload(rows=[{"Price": "1", "_source": {"a": 1, "b": 2}, "Name": "x", "name": "y"}])
