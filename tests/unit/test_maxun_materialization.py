@@ -265,6 +265,21 @@ def test_untrusted_metadata_cannot_change_materialization_path(tmp_path: Path):
     ) == [("v1", IDS["workspace"], "workspace.duckdb")]
 
 
+def test_failed_build_does_not_publish_partial_final_file(tmp_path: Path, monkeypatch):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+
+    def fail_build(*_args, **_kwargs):
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setattr(materializer, "_build", fail_build)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        materializer.materialize(request)
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    assert not (workspace_dir / "workspace.duckdb").exists()
+    assert not list(workspace_dir.glob("workspace.tmp.*.duckdb"))
+
+
 def test_same_workspace_concurrent_builds_are_idempotent(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
