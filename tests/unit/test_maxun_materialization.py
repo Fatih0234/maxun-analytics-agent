@@ -168,8 +168,19 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
 def test_empty_sources_preserve_schema_and_manifests(tmp_path: Path):
     body = payload()
     body["sources"][0]["projection"]["rows"] = []
+    second = dict(body["sources"][0])
+    second.update(
+        {
+            "workspaceSourceId": "88888888-8888-4888-8888-888888888888",
+            "projectionId": "99999999-9999-4999-8999-999999999999",
+            "sourceOrder": 1,
+            "projection": {"columns": body["sources"][0]["projection"]["columns"], "rows": []},
+        }
+    )
+    body["sources"].append(second)
     request = MaterializationRequest.model_validate(body)
     result = Materializer(tmp_path).materialize(request)
+    assert result["sourceCount"] == 2
     assert result["rowCount"] == 0
     assert len(result["schema"]) == 4
     database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
