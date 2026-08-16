@@ -471,6 +471,22 @@ def test_internal_http_route_enforces_token_and_returns_bounded_response(
     assert "workspace.duckdb" not in response.text
 
 
+def test_http_request_limit_rejects_before_json_parse(tmp_path: Path, monkeypatch):
+    app = FastAPI()
+    app.include_router(maxun_api.router)
+    monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", "internal-secret")
+    monkeypatch.setattr(maxun_api, "_materializer", Materializer(tmp_path))
+    monkeypatch.setattr(maxun_api, "MAX_REQUEST_BYTES", 1)
+    with TestClient(app) as client:
+        response = client.put(
+            f"/internal/maxun/materializations/{IDS['workspace']}",
+            headers={"Authorization": "Bearer internal-secret"},
+            json=payload(),
+        )
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "MATERIALIZATION_LIMIT_EXCEEDED"
+
+
 def test_authorization_fails_closed(monkeypatch):
     monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", "secret")
     with pytest.raises(MaterializationError):
