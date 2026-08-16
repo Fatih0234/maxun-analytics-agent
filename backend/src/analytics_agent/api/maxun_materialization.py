@@ -36,12 +36,14 @@ async def materialize_workspace(
         if str(UUID(workspace_id)) != workspace_id:
             raise ValueError
         authorize_token(authorization)
-        raw = await request.body()
-        if len(raw) > MAX_REQUEST_BYTES:
-            raise MaterializationError(
-                "MATERIALIZATION_LIMIT_EXCEEDED", "request is too large", 413
-            )
-        payload = json.loads(raw)
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > MAX_REQUEST_BYTES:
+                raise MaterializationError(
+                    "MATERIALIZATION_LIMIT_EXCEEDED", "request is too large", 413
+                )
+            raw.extend(chunk)
+        payload = json.loads(bytes(raw))
         parsed = MaterializationRequest.model_validate(payload)
         if parsed.workspace.id != workspace_id:
             raise MaterializationError(
