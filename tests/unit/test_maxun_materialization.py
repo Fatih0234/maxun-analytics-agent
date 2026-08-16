@@ -391,6 +391,21 @@ def test_failed_build_does_not_publish_partial_final_file(tmp_path: Path, monkey
     assert not list(workspace_dir.glob("workspace.tmp.*.duckdb"))
 
 
+def test_materialization_capacity_returns_bounded_busy_error(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer._wait_seconds = 0.1
+    assert materializer._semaphore.acquire()
+    assert materializer._semaphore.acquire()
+    try:
+        with pytest.raises(MaterializationError) as error:
+            materializer.materialize(request)
+        assert error.value.code == "MATERIALIZATION_BUSY"
+    finally:
+        materializer._semaphore.release()
+        materializer._semaphore.release()
+
+
 def test_same_workspace_concurrent_builds_are_idempotent(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
