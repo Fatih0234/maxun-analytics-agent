@@ -254,6 +254,17 @@ def test_digest_ignores_json_object_key_order():
     )
 
 
+def test_untrusted_metadata_cannot_change_materialization_path(tmp_path: Path):
+    body = payload()
+    body["sources"][0]["sourceDatasetKey"] = "../../outside"
+    body["sources"][0]["displayName"] = "/tmp/customer-name"
+    body["workspace"]["dataFormatSnapshot"]["name"] = "../../format"
+    Materializer(tmp_path).materialize(MaterializationRequest.model_validate(body))
+    assert sorted(
+        path.relative_to(tmp_path).parts for path in tmp_path.rglob("workspace.duckdb")
+    ) == [("v1", IDS["workspace"], "workspace.duckdb")]
+
+
 def test_same_workspace_concurrent_builds_are_idempotent(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
