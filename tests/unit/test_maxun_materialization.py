@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import duckdb
@@ -135,6 +136,15 @@ def test_digest_ignores_json_object_key_order():
     assert input_digest(MaterializationRequest.model_validate(left)) == input_digest(
         MaterializationRequest.model_validate(right)
     )
+
+
+def test_same_workspace_concurrent_builds_are_idempotent(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(materializer.materialize, [request, request]))
+    assert results[0] == results[1]
+    assert results[0]["rowCount"] == 1
 
 
 def test_integrity_conflict_is_rejected(tmp_path: Path):
