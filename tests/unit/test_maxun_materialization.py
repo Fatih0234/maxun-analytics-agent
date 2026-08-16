@@ -197,6 +197,33 @@ def test_supported_types_and_typed_blanks_are_materialized(tmp_path: Path):
     assert by_name["Broken"]["duckdbType"] == "VARCHAR"
 
 
+def test_overflow_and_mixed_timestamp_fallbacks_preserve_original_text(tmp_path: Path):
+    columns = ["Large", "Naive", "Mixed"]
+    rows = [
+        {
+            "Large": "9223372036854775808",
+            "Naive": "2026-01-01T10:00:00",
+            "Mixed": "2026-01-01T10:00:00Z",
+        },
+        {
+            "Large": "9223372036854775809",
+            "Naive": "2026-01-02T10:00:00",
+            "Mixed": "2026-01-02T10:00:00",
+        },
+    ]
+    body = payload(columns=columns, rows=rows)
+    body["workspace"]["dataFormatSnapshot"]["columns"] = [
+        {"name": "Large", "type": "number"},
+        {"name": "Naive", "type": "datetime"},
+        {"name": "Mixed", "type": "datetime"},
+    ]
+    result = Materializer(tmp_path).materialize(MaterializationRequest.model_validate(body))
+    by_name = {item["logicalName"]: item for item in result["schema"]}
+    assert by_name["Large"]["duckdbType"] == "VARCHAR"
+    assert by_name["Naive"]["duckdbType"] == "TIMESTAMP"
+    assert by_name["Mixed"]["duckdbType"] == "VARCHAR"
+
+
 def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
     columns = ["unsafe\x00name"]
     request = MaterializationRequest.model_validate(

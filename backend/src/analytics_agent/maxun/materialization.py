@@ -290,10 +290,10 @@ def _type_and_rule(values: list[Any], hint: str) -> tuple[str, str]:
     if hint in {"number", "numeric", "float", "decimal", "price"}:
         try:
             nums = [_strict_number(value) for value in nonnull]
-            if all(
-                n is not None and n == n.to_integral_value() and -(2**63) <= n < 2**63 for n in nums
-            ):
-                return "BIGINT", "strict-number"
+            if all(n is not None and n == n.to_integral_value() for n in nums):
+                if all(-(2**63) <= n < 2**63 for n in nums):
+                    return "BIGINT", "strict-number"
+                return "VARCHAR", "number-overflow-varchar"
             if all(n is not None for n in nums):
                 return "DOUBLE", "strict-number"
         except ValueError:
@@ -334,10 +334,10 @@ def _type_and_rule(values: list[Any], hint: str) -> tuple[str, str]:
             return "VARCHAR", "timestamp-fallback-varchar"
     if nonnull and all(isinstance(v, bool) for v in nonnull):
         return "BOOLEAN", "inferred-boolean"
-    if nonnull and all(
-        isinstance(v, int) and not isinstance(v, bool) and -(2**63) <= v < 2**63 for v in nonnull
-    ):
-        return "BIGINT", "inferred-integer"
+    if nonnull and all(isinstance(v, int) and not isinstance(v, bool) for v in nonnull):
+        if all(-(2**63) <= v < 2**63 for v in nonnull):
+            return "BIGINT", "inferred-integer"
+        return "VARCHAR", "integer-overflow-varchar"
     if nonnull and all(
         isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
         for v in nonnull
