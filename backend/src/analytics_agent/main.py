@@ -104,6 +104,10 @@ async def propagate_datahub_env() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from analytics_agent.build_identity import validate_build_identity
+
+    validate_build_identity()
+
     # Fail fast if rows are encrypted but the master key is absent.
     # Must run BEFORE any DB read that would deserialize EncryptedJSON columns.
     await _check_encryption_key_consistency()

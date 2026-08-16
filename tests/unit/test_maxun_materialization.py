@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +23,7 @@ from analytics_agent.maxun.materialization import (
     _physical_names,
     _settings,
     authorize_token,
+    canonical_materialization_payload,
     input_digest,
 )
 from fastapi import FastAPI
@@ -371,6 +374,18 @@ def test_digest_ignores_json_object_key_order():
     assert input_digest(MaterializationRequest.model_validate(left)) == input_digest(
         MaterializationRequest.model_validate(right)
     )
+
+
+def test_shared_jcs_fixture_matches_canonical_bytes_and_sha256():
+    fixture_path = (
+        Path(__file__).parents[1] / "fixtures" / "maxun_materialization_digest_vectors.json"
+    )
+    fixture = json.loads(fixture_path.read_text())
+    for vector in fixture["vectors"]:
+        request = MaterializationRequest.model_validate(vector["request"])
+        canonical = canonical_materialization_payload(request)
+        assert canonical == vector["canonical"], vector["name"]
+        assert hashlib.sha256(canonical.encode()).hexdigest() == vector["sha256"]
 
 
 def test_digest_matches_cross_runtime_golden_vector():

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import math
 import os
 import re
@@ -19,6 +18,7 @@ from typing import Any
 from uuid import UUID
 
 import duckdb
+import rfc8785
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_SOURCES = 100
@@ -217,33 +217,11 @@ def _reject_nonfinite(value: Any) -> None:
             _reject_nonfinite(item)
 
 
-def _canonical_value(value: Any) -> Any:
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("non-finite number")
-        if value == 0 or value.is_integer():
-            return int(value)
-        return value
-    if isinstance(value, list):
-        return [_canonical_value(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _canonical_value(item) for key, item in value.items()}
-    return value
-
-
 def canonical_json(value: Any) -> str:
-    return json.dumps(
-        _canonical_value(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return rfc8785.dumps(value).decode("utf-8")
 
 
-def input_digest(request: MaterializationRequest) -> str:
+def canonical_materialization_payload(request: MaterializationRequest) -> str:
     sources = []
     for source in sorted(request.sources, key=lambda item: item.sourceOrder):
         rows = [
@@ -273,7 +251,11 @@ def input_digest(request: MaterializationRequest) -> str:
         "workspace": request.workspace.model_dump(),
         "sources": sources,
     }
-    return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+    return canonical_json(payload)
+
+
+def input_digest(request: MaterializationRequest) -> str:
+    return hashlib.sha256(canonical_materialization_payload(request).encode()).hexdigest()
 
 
 def _hint(snapshot: WorkspaceSnapshot, name: str) -> str:

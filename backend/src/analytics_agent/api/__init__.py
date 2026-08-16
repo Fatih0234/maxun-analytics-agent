@@ -62,8 +62,10 @@ async def _fetch_releases(limit: int = 10) -> list[dict]:
 async def get_version():
     """Return the running version and whether a newer GitHub release is available."""
     from analytics_agent._version import get_package_version
+    from analytics_agent.build_identity import build_identity
 
     current = get_package_version()
+    identity = build_identity()
 
     releases = await _fetch_releases(limit=1)
     latest_version: str | None = None
@@ -82,7 +84,9 @@ async def get_version():
     return {
         "service": os.environ.get("ANALYTICS_AGENT_SERVICE_ID", "analytics-agent"),
         "current_version": current,
-        "build_revision": os.environ.get("MAXUN_ANALYTICS_BUILD_SHA", "unknown"),
+        "build_revision": identity["actual"],
+        "expected_build_revision": identity["expected"],
+        "build_revision_matches": identity["matches"],
         "release_repository": _GITHUB_REPO,
         "latest_version": latest_version,
         "update_available": update_available,
