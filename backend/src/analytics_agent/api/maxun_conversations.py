@@ -8,12 +8,14 @@ credential shared by the Maxun backend.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hmac
 import logging
+import os
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -118,6 +120,50 @@ def _lock_for(conversation_id: str):
     return lock
 
 
+async def _mock_maxun_events(
+    engine: Any,
+    conversation_id: str,
+    question: str,
+) -> AsyncIterator[dict[str, Any]]:
+    """Deterministic test-only path used by local smoke/e2e environments.
+
+    It still invokes the real workspace tool and therefore exercises the
+    materialization, AST policy, bounded DuckDB result, adapter, and Maxun
+    transport without requiring a provider key. Production deployments must
+    leave MOCK_LLM unset.
+    """
+
+    lowered = question.casefold()
+    sql = 'SELECT SUM("Price") AS total FROM data' if "sum" in lowered or "total" in lowered else "SELECT COUNT(*) AS count FROM data"
+    execute = next((item for item in engine.get_tools() if item.name == "execute_sql"), None)
+    if execute is None:
+        raise MaxunQueryError("MAXUN_QUERY_FAILED", "The workspace query could not be completed")
+    raw = await asyncio.to_thread(execute.invoke, {"sql": sql})
+    result = orjson.loads(raw)
+    if result.get("error"):
+        yield {
+            "event": "ERROR",
+            "conversation_id": conversation_id,
+            "payload": {"error": "The workspace question could not be completed"},
+        }
+        return
+    rows = result.get("rows", [])
+    value = rows[0].get("total" if "sum" in lowered or "total" in lowered else "count") if rows else None
+    answer = f"The result is {value}."
+    yield {
+        "event": "SQL",
+        "conversation_id": conversation_id,
+        "payload": {
+            "sql": sql,
+            "columns": result.get("columns", []),
+            "rows": rows,
+            "truncated": result.get("truncated", False),
+        },
+    }
+    yield {"event": "TEXT", "conversation_id": conversation_id, "payload": {"text": answer}}
+    yield {"event": "COMPLETE", "conversation_id": conversation_id, "payload": {"text": answer}}
+
+
 def _result_from_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     answer_parts: list[str] = []
     sql_result: dict[str, Any] | None = None
@@ -190,23 +236,27 @@ async def _run_turn(
                 request.question.strip(),
                 max_history_tokens=settings.max_history_tokens,
             )
-            graph = build_graph(
-                engine_name=expected_engine,
-                engine=engine,
-                engine_tools=engine.get_tools(),
-                context_tools=[],
-                disabled_tools={"create_chart"},
-                enabled_mutations=set(),
-                maxun_readonly=True,
-            )
-            async for event in stream_graph_events(
-                graph=graph,
-                user_text=request.question.strip(),
-                conversation_id=conversation_id,
-                engine_name=expected_engine,
-                keepalive_interval=settings.sse_keepalive_interval,
-                history=history,
-            ):
+            if os.environ.get("MOCK_LLM") == "1":
+                event_stream = _mock_maxun_events(engine, conversation_id, request.question.strip())
+            else:
+                graph = build_graph(
+                    engine_name=expected_engine,
+                    engine=engine,
+                    engine_tools=engine.get_tools(),
+                    context_tools=[],
+                    disabled_tools={"create_chart"},
+                    enabled_mutations=set(),
+                    maxun_readonly=True,
+                )
+                event_stream = stream_graph_events(
+                    graph=graph,
+                    user_text=request.question.strip(),
+                    conversation_id=conversation_id,
+                    engine_name=expected_engine,
+                    keepalive_interval=settings.sse_keepalive_interval,
+                    history=history,
+                )
+            async for event in event_stream:
                 event_type = event.get("event")
                 if event_type in {"KEEPALIVE", "USAGE", "CHART"}:
                     continue

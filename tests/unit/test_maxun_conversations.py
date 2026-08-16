@@ -37,6 +37,7 @@ def app_and_db(tmp_path: Path, monkeypatch):
     asyncio.run(create_schema())
     monkeypatch.setattr(adapter, "_get_session_factory", lambda: sessions)
     monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", TOKEN)
+    monkeypatch.delenv("MOCK_LLM", raising=False)
 
     async def fake_resolve_engine(*args, **kwargs):
         return _resolved_engine()
