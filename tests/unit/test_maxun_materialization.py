@@ -8,6 +8,7 @@ from analytics_agent.maxun.materialization import (
     MaterializationError,
     MaterializationRequest,
     Materializer,
+    _settings,
     authorize_token,
     input_digest,
 )
@@ -95,6 +96,15 @@ def test_integrity_conflict_is_rejected(tmp_path: Path):
     with pytest.raises(MaterializationError) as error:
         materializer.materialize(MaterializationRequest.model_validate(changed))
     assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+
+
+def test_duckdb_external_access_and_extensions_are_disabled():
+    connection = duckdb.connect(":memory:")
+    _settings(connection)
+    for statement in ("ATTACH '/tmp/external.db' AS external_db", "LOAD httpfs", "SELECT * FROM read_csv('/etc/passwd')"):
+        with pytest.raises(duckdb.Error):
+            connection.execute(statement)
+    connection.close()
 
 
 def test_authorization_fails_closed(monkeypatch):

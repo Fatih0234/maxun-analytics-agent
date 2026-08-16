@@ -376,7 +376,9 @@ def _manifest(connection: duckdb.DuckDBPyConnection) -> dict[str, Any] | None:
 
 class Materializer:
     def __init__(self, root: str | Path | None = None):
-        self.root = Path(root or os.environ.get("MAXUN_MATERIALIZATION_ROOT", "/var/lib/maxun-analytics/materializations"))
+        configured_root = os.environ.get("MAXUN_MATERIALIZATION_ROOT", "").strip()
+        default_root = Path(os.environ.get("ANALYTICS_AGENT_CONFIG_DIR", "~/.datahub/analytics-agent")).expanduser() / "materializations"
+        self.root = Path(root or configured_root or default_root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def _paths(self, workspace_id: str) -> tuple[Path, Path, Path]:
