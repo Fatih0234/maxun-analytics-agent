@@ -23,6 +23,7 @@ requires-python = ">=3.11"
 dependencies = [
     # Web
     "fastapi>=0.115.0",
+    "anyio>=4.0.0",
     "uvicorn[standard]>=0.30.0",
     # DB
     "sqlalchemy[asyncio]>=2.0.0",

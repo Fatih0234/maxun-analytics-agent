@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,7 @@ from pathlib import Path
 from threading import Event, Thread
 
 import duckdb
+import httpx
 import pytest
 from analytics_agent.api import maxun_materialization as maxun_api
 from analytics_agent.maxun import materialization as materialization_module
@@ -15,6 +17,8 @@ from analytics_agent.maxun.materialization import (
     MaterializationError,
     MaterializationRequest,
     Materializer,
+    _lock,
+    _physical_names,
     _settings,
     authorize_token,
     input_digest,
@@ -164,9 +168,9 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
     assert first["rowCount"] == 1
     assert [item["physicalName"] for item in first["schema"]] == [
         "Price",
-        "c_001_3e0763ca",
+        "c_001_deba44c6",
         "Name",
-        "c_003_8801b486",
+        "c_003_7fe9106f",
     ]
     database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
     assert database.stat().st_mode & 0o777 == 0o600
@@ -326,6 +330,32 @@ def test_internal_namespace_identifier_is_mapped_without_replacing_manifest(tmp_
         assert connection.execute("select count(*) from __maxun_manifest").fetchone() == (1,)
 
 
+def test_reserved_identifier_case_variants_are_mapped(tmp_path: Path):
+    columns = [
+        "_SOURCE",
+        "_SOURCE_ROLE",
+        "_CAPTURED_AT",
+        "_CAPTURED_AT_TS",
+        "_RUN_ID",
+        "_ROBOT_ID",
+        "_MAPPING_ID",
+        "_PROJECTION_ID",
+        "_SOURCE_DATASET_KEY",
+        "_WORKSPACE_SOURCE_ID",
+        "_SOURCE_ORDER",
+    ]
+    body = payload(columns=columns, rows=[{column: "value" for column in columns}])
+    result = Materializer(tmp_path).materialize(MaterializationRequest.model_validate(body))
+    assert all(item["physicalName"] != item["logicalName"] for item in result["schema"])
+
+
+def test_generated_identifier_collision_gets_a_deterministic_alternate():
+    generated = _physical_names(["customer", "_source"])[1][1]
+    mapped = _physical_names([generated, "_source"])
+    assert mapped[0][1] == generated
+    assert mapped[1][1] != generated
+
+
 def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
     columns = ["unsafe\x00name"]
     request = MaterializationRequest.model_validate(
@@ -340,6 +370,18 @@ def test_digest_ignores_json_object_key_order():
     right = payload(rows=[{"Price": "1", "_source": {"a": 1, "b": 2}, "Name": "x", "name": "y"}])
     assert input_digest(MaterializationRequest.model_validate(left)) == input_digest(
         MaterializationRequest.model_validate(right)
+    )
+
+
+def test_digest_matches_cross_runtime_golden_vector():
+    body = payload(
+        columns=["Name", "Value", "Empty", "Nested"],
+        rows=[{"Name": "Éclair", "Value": 1.0, "Empty": "", "Nested": {"z": 2.5, "a": None}}],
+    )
+    body["workspace"]["dataFormatSnapshot"]["columns"] = []
+    body["sources"][0]["capturedAt"] = "2026-08-15T10:01:00.000Z"
+    assert input_digest(MaterializationRequest.model_validate(body)) == (
+        "d97967138473cbd85f2a83218c7114bf6f22c072f40c2d95a725e68c19367a0a"
     )
 
 
@@ -435,6 +477,33 @@ def test_delete_waits_for_build_and_removes_published_database(tmp_path: Path, m
     assert not (tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
 
 
+def test_stable_lock_blocks_rebuild_after_delete_removes_directory(tmp_path: Path):
+    import shutil
+
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    directory, _, lock_path = materializer._paths(IDS["workspace"])
+    started = Event()
+    finished = Event()
+    original_build = materializer._build
+
+    def observe_build(*args, **kwargs):
+        started.set()
+        return original_build(*args, **kwargs)
+
+    materializer._build = observe_build
+    with _lock(lock_path):
+        shutil.rmtree(directory)
+        worker = Thread(target=lambda: (materializer.materialize(request), finished.set()))
+        worker.start()
+        time.sleep(0.1)
+        assert not started.is_set()
+    worker.join(2)
+    assert finished.is_set()
+    assert started.is_set()
+
+
 def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
@@ -443,6 +512,28 @@ def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
     os.utime(database, (100, 100))
     assert materializer.cleanup_expired(ttl_seconds=10, now=111) == 1
     assert not database.exists()
+
+
+def test_ttl_cleanup_removes_stale_final_less_temp_files(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    directory = tmp_path / "v1" / IDS["workspace"]
+    directory.mkdir()
+    temp = directory / "workspace.tmp.crashed.duckdb.wal"
+    temp.write_bytes(b"orphan")
+    os.utime(temp, (100, 100))
+    assert materializer.cleanup_expired(ttl_seconds=10, now=111) == 1
+    assert not directory.exists()
+
+
+def test_ttl_cleanup_keeps_fresh_final_less_temp_files(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    directory = tmp_path / "v1" / IDS["workspace"]
+    directory.mkdir()
+    temp = directory / "workspace.tmp.active.duckdb"
+    temp.write_bytes(b"active")
+    os.utime(temp, (105, 105))
+    assert materializer.cleanup_expired(ttl_seconds=10, now=111) == 0
+    assert temp.exists()
 
 
 def test_integrity_conflict_is_rejected(tmp_path: Path):
@@ -494,6 +585,48 @@ def test_internal_http_route_enforces_token_and_returns_bounded_response(
     assert response.status_code == 200
     assert response.json()["relation"] == "data"
     assert "workspace.duckdb" not in response.text
+
+
+async def test_http_materialization_does_not_block_lightweight_requests(
+    tmp_path: Path, monkeypatch
+):
+    app = FastAPI()
+    app.include_router(maxun_api.router)
+
+    @app.get("/ping")
+    async def ping():
+        return {"ok": True}
+
+    monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", "internal-secret")
+    materializer = Materializer(tmp_path)
+    entered = Event()
+    release = Event()
+    original_materialize = materializer.materialize
+
+    def blocked_materialize(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(materializer, "materialize", blocked_materialize)
+    monkeypatch.setattr(maxun_api, "_materializer", materializer)
+    body = payload()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        materialization = asyncio.create_task(
+            client.put(
+                f"/internal/maxun/materializations/{IDS['workspace']}",
+                headers={"Authorization": "Bearer internal-secret"},
+                json=body,
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        response = await client.get("/ping")
+        assert response.status_code == 200
+        release.set()
+        completed = await materialization
+    assert completed.status_code == 200
 
 
 def test_http_request_limit_rejects_before_json_parse(tmp_path: Path, monkeypatch):

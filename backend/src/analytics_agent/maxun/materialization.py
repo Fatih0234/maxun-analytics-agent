@@ -44,6 +44,7 @@ RESERVED_COLUMNS = {
     "_workspace_source_id",
     "_source_order",
 }
+RESERVED_COLUMNS_CASE_INSENSITIVE = {column.lower() for column in RESERVED_COLUMNS}
 SYSTEM_COLUMNS = [
     ("_source", "VARCHAR"),
     ("_source_role", "VARCHAR"),
@@ -216,9 +217,29 @@ def _reject_nonfinite(value: Any) -> None:
             _reject_nonfinite(item)
 
 
+def _canonical_value(value: Any) -> Any:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite number")
+        if value == 0 or value.is_integer():
+            return int(value)
+        return value
+    if isinstance(value, list):
+        return [_canonical_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _canonical_value(item) for key, item in value.items()}
+    return value
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        _canonical_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -420,13 +441,19 @@ def _physical_names(columns: list[str]) -> list[tuple[str, str, bool]]:
     result = []
     for ordinal, logical in enumerate(columns):
         collision = (
-            logical in RESERVED_COLUMNS
+            logical.lower() in RESERVED_COLUMNS_CASE_INSENSITIVE
             or logical.lower().startswith("__maxun_")
             or logical.lower() in seen
         )
         if collision or "\x00" in logical:
-            suffix = hashlib.sha256(f"{ordinal}:{logical}".encode()).hexdigest()[:8]
-            physical, mapped = f"c_{ordinal:03d}_{suffix}", True
+            mapped = True
+            attempt = 0
+            while True:
+                suffix = hashlib.sha256(f"{ordinal}:{logical}:{attempt}".encode()).hexdigest()[:8]
+                physical = f"c_{ordinal:03d}_{suffix}"
+                if physical.lower() not in seen:
+                    break
+                attempt += 1
         else:
             physical, mapped = logical, False
         if physical.lower() in seen:
@@ -446,6 +473,8 @@ def _quote(identifier: str) -> str:
 def _lock(path: Path) -> Iterator[None]:
     import fcntl
 
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
     path.touch(mode=0o600, exist_ok=True)
     path.chmod(0o600)
     with path.open("r+") as handle:
@@ -508,6 +537,9 @@ class Materializer:
         self._semaphore = threading.BoundedSemaphore(concurrency)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
+        (self.root / "v1" / ".locks").mkdir(mode=0o700, parents=True, exist_ok=True)
+        (self.root / "v1").chmod(0o700)
+        (self.root / "v1" / ".locks").chmod(0o700)
 
     @contextmanager
     def _capacity(self) -> Iterator[None]:
@@ -523,7 +555,8 @@ class Materializer:
     def _paths(self, workspace_id: str) -> tuple[Path, Path, Path]:
         workspace = str(_uuid(workspace_id))
         directory = self.root / "v1" / workspace
-        return directory, directory / "workspace.duckdb", directory / "workspace.lock"
+        lock_path = self.root / "v1" / ".locks" / f"{workspace}.lock"
+        return directory, directory / "workspace.duckdb", lock_path
 
     def materialize(
         self, request: MaterializationRequest, request_bytes: int | None = None
@@ -534,9 +567,9 @@ class Materializer:
             )
         digest = input_digest(request)
         directory, final, lock_path = self._paths(request.workspace.id)
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory.chmod(0o700)
         with self._capacity(), _lock(lock_path):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
             if final.exists():
                 try:
                     with duckdb.connect(str(final), read_only=True) as existing:
@@ -732,14 +765,23 @@ class Materializer:
 
     def delete(self, workspace_id: str) -> None:
         directory, _, lock_path = self._paths(workspace_id)
-        if not directory.exists():
-            return
         with _lock(lock_path):
+            if not directory.exists():
+                return
             if directory.resolve().parent != (self.root / "v1").resolve():
                 raise MaterializationError(
                     "MATERIALIZATION_INVALID_CONTRACT", "invalid materialization path"
                 )
             shutil.rmtree(directory)
+
+    @staticmethod
+    def _is_known_artifact(path: Path) -> bool:
+        return (
+            path.name == "workspace.duckdb"
+            or path.name == "workspace.duckdb.wal"
+            or path.name == "workspace.lock"
+            or path.name.startswith("workspace.tmp.")
+        )
 
     def cleanup_expired(self, ttl_seconds: int = 86_400, now: float | None = None) -> int:
         if ttl_seconds < 1:
@@ -748,6 +790,7 @@ class Materializer:
         if not base.exists():
             return 0
         current = now if now is not None else time.time()
+        cutoff = current - ttl_seconds
         removed = 0
         for directory in base.iterdir():
             if not directory.is_dir() or directory.is_symlink():
@@ -756,13 +799,31 @@ class Materializer:
                 workspace_id = str(UUID(directory.name))
                 if directory.resolve().parent != base.resolve():
                     continue
-                final = directory / "workspace.duckdb"
-                if not final.exists() or current - final.stat().st_mtime <= ttl_seconds:
-                    continue
-                _, _, lock_path = self._paths(workspace_id)
+                _, final, lock_path = self._paths(workspace_id)
                 with _lock(lock_path):
-                    if final.exists() and current - final.stat().st_mtime > ttl_seconds:
+                    entries = list(directory.iterdir())
+                    if final.exists() and final.stat().st_mtime <= cutoff:
                         shutil.rmtree(directory)
+                        removed += 1
+                        continue
+                    for artifact in entries:
+                        if (
+                            artifact.is_file()
+                            and self._is_known_artifact(artifact)
+                            and artifact.stat().st_mtime <= cutoff
+                        ):
+                            artifact.unlink(missing_ok=True)
+                    remaining = [entry for entry in directory.iterdir()]
+                    if (
+                        not final.exists()
+                        and remaining
+                        and all(self._is_known_artifact(entry) for entry in remaining)
+                        and all(entry.stat().st_mtime <= cutoff for entry in remaining)
+                    ):
+                        shutil.rmtree(directory)
+                        removed += 1
+                    elif not final.exists() and not remaining:
+                        directory.rmdir()
                         removed += 1
             except (OSError, ValueError):
                 continue

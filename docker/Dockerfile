@@ -12,6 +12,11 @@ RUN cd frontend && pnpm build
 FROM python:3.12-slim
 WORKDIR /app
 
+ARG MAXUN_ANALYTICS_BUILD_SHA=unknown
+ENV ANALYTICS_AGENT_SERVICE_ID=maxun-analytics-agent \
+    ANALYTICS_AGENT_RELEASE_REPOSITORY=Fatih0234/maxun-analytics-agent \
+    MAXUN_ANALYTICS_BUILD_SHA=${MAXUN_ANALYTICS_BUILD_SHA}
+
 RUN pip install uv
 
 COPY pyproject.toml uv.lock README.md hatch_build.py ./

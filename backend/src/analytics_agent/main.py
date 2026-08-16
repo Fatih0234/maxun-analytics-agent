@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -55,6 +57,25 @@ async def register_engines_from_db() -> None:
             logger.warning("Failed to register engine %s: %s", intg.name, e)
 
 
+async def _materialization_cleanup_loop(
+    materializer: object,
+    ttl_seconds: int,
+    interval_seconds: int,
+) -> None:
+    from analytics_agent.maxun.materialization import Materializer
+
+    if not isinstance(materializer, Materializer):
+        raise TypeError("invalid materializer")
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await asyncio.to_thread(materializer.cleanup_expired, ttl_seconds)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Maxun materialization cleanup failed: %s", type(exc).__name__
+            )
+
+
 async def propagate_datahub_env() -> None:
     """Copy the first DataHub context platform's URL/token into ``os.environ``.
 
@@ -96,11 +117,21 @@ async def lifespan(app: FastAPI):
 
     # Derived Maxun workspaces are disposable cache entries. Cleanup is best
     # effort and never prevents the Analytics Agent from starting.
+    materialization_cleanup_task: asyncio.Task[None] | None = None
     try:
         from analytics_agent.maxun.materialization import Materializer
 
         ttl_seconds = int(os.environ.get("MAXUN_MATERIALIZATION_TTL_SECONDS", "86400"))
-        Materializer().cleanup_expired(ttl_seconds)
+        interval_seconds = int(
+            os.environ.get("MAXUN_MATERIALIZATION_CLEANUP_INTERVAL_SECONDS", "3600")
+        )
+        if ttl_seconds < 1 or interval_seconds < 60:
+            raise ValueError("materialization cleanup settings must be positive")
+        materializer = Materializer()
+        await asyncio.to_thread(materializer.cleanup_expired, ttl_seconds)
+        materialization_cleanup_task = asyncio.create_task(
+            _materialization_cleanup_loop(materializer, ttl_seconds, interval_seconds)
+        )
     except Exception as exc:
         logging.getLogger(__name__).warning(
             "Maxun materialization cleanup skipped: %s", type(exc).__name__
@@ -140,6 +171,11 @@ async def lifespan(app: FastAPI):
     _asyncio.create_task(_discover_mcp_tools_on_boot())
 
     yield
+
+    if materialization_cleanup_task is not None:
+        materialization_cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await materialization_cleanup_task
 
     from analytics_agent.engines.factory import close_all
 

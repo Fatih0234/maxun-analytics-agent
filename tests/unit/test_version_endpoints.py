@@ -13,6 +13,7 @@ Key cases exercised:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -142,6 +143,29 @@ async def test_version_endpoint_airgapped():
     assert result["current_version"] == "0.2.2"
     assert result["latest_version"] is None
     assert result["update_available"] is False
+
+
+async def test_version_endpoint_reports_maxun_build_identity():
+    import analytics_agent.api as api_mod
+
+    api_mod._releases_cache.clear()
+    with (
+        patch.object(api_mod, "_fetch_releases", new=AsyncMock(return_value=[])),
+        patch("importlib.metadata.version", return_value="0.4.0"),
+        patch.object(api_mod, "_GITHUB_REPO", "Fatih0234/maxun-analytics-agent"),
+        patch.dict(
+            os.environ,
+            {
+                "ANALYTICS_AGENT_SERVICE_ID": "maxun-analytics-agent",
+                "MAXUN_ANALYTICS_BUILD_SHA": "abc123",
+            },
+        ),
+    ):
+        result = await api_mod.get_version()
+
+    assert result["service"] == "maxun-analytics-agent"
+    assert result["build_revision"] == "abc123"
+    assert result["release_repository"] == "Fatih0234/maxun-analytics-agent"
 
 
 async def test_version_endpoint_up_to_date():

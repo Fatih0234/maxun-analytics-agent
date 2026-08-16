@@ -4,6 +4,7 @@ import json
 import logging
 from uuid import UUID
 
+import anyio
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import ValidationError
 
@@ -43,13 +44,20 @@ async def materialize_workspace(
                     "MATERIALIZATION_LIMIT_EXCEEDED", "request is too large", 413
                 )
             raw.extend(chunk)
-        payload = json.loads(bytes(raw))
-        parsed = MaterializationRequest.model_validate(payload)
+        raw_bytes = bytes(raw)
+        parsed = await anyio.to_thread.run_sync(
+            _parse_materialization_request,
+            raw_bytes,
+        )
         if parsed.workspace.id != workspace_id:
             raise MaterializationError(
                 "MATERIALIZATION_INVALID_CONTRACT", "workspace path mismatch"
             )
-        return _materializer.materialize(parsed, request_bytes=len(raw))
+        return await anyio.to_thread.run_sync(
+            _materializer.materialize,
+            parsed,
+            len(raw_bytes),
+        )
     except MaterializationError as error:
         raise _error(error) from error
     except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as error:
@@ -67,8 +75,12 @@ async def materialize_workspace(
         ) from error
 
 
+def _parse_materialization_request(raw: bytes) -> MaterializationRequest:
+    return MaterializationRequest.model_validate(json.loads(raw))
+
+
 @router.delete("/{workspace_id}", status_code=204)
-async def delete_materialization(
+def delete_materialization(
     workspace_id: str,
     authorization: str | None = Header(default=None),
 ) -> None:

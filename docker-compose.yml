@@ -21,12 +21,19 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        MAXUN_ANALYTICS_BUILD_SHA: ${MAXUN_ANALYTICS_BUILD_SHA:-unknown}
     ports:
       - "8100:8100"
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://talk_to_data:talk_to_data@postgres:5432/talk_to_data
+      ANALYTICS_AGENT_SERVICE_ID: ${ANALYTICS_AGENT_SERVICE_ID:-maxun-analytics-agent}
+      ANALYTICS_AGENT_RELEASE_REPOSITORY: ${ANALYTICS_AGENT_RELEASE_REPOSITORY:-Fatih0234/maxun-analytics-agent}
+      MAXUN_ANALYTICS_BUILD_SHA: ${MAXUN_ANALYTICS_BUILD_SHA:-unknown}
       MAXUN_MATERIALIZATION_ROOT: /var/lib/maxun-analytics/materializations
+      MAXUN_MATERIALIZATION_TTL_SECONDS: ${MAXUN_MATERIALIZATION_TTL_SECONDS:-86400}
+      MAXUN_MATERIALIZATION_CLEANUP_INTERVAL_SECONDS: ${MAXUN_MATERIALIZATION_CLEANUP_INTERVAL_SECONDS:-3600}
     depends_on:
       postgres:
         condition: service_healthy
