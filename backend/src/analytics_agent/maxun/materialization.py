@@ -473,9 +473,27 @@ class Materializer:
             raise ValueError("MAXUN_MATERIALIZATION_CONCURRENCY must be an integer") from exc
         if not 1 <= concurrency <= 16:
             raise ValueError("MAXUN_MATERIALIZATION_CONCURRENCY must be between 1 and 16")
+        try:
+            wait_seconds = float(os.environ.get("MAXUN_MATERIALIZATION_WAIT_SECONDS", "30"))
+        except ValueError as exc:
+            raise ValueError("MAXUN_MATERIALIZATION_WAIT_SECONDS must be numeric") from exc
+        if not 0.1 <= wait_seconds <= 300:
+            raise ValueError("MAXUN_MATERIALIZATION_WAIT_SECONDS must be between 0.1 and 300")
+        self._wait_seconds = wait_seconds
         self._semaphore = threading.BoundedSemaphore(concurrency)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
+
+    @contextmanager
+    def _capacity(self) -> Iterator[None]:
+        if not self._semaphore.acquire(timeout=self._wait_seconds):
+            raise MaterializationError(
+                "MATERIALIZATION_BUSY", "materialization capacity is busy", 409
+            )
+        try:
+            yield
+        finally:
+            self._semaphore.release()
 
     def _paths(self, workspace_id: str) -> tuple[Path, Path, Path]:
         workspace = str(_uuid(workspace_id))
@@ -493,7 +511,7 @@ class Materializer:
         directory, final, lock_path = self._paths(request.workspace.id)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.chmod(0o700)
-        with self._semaphore, _lock(lock_path):
+        with self._capacity(), _lock(lock_path):
             if final.exists():
                 try:
                     with duckdb.connect(str(final), read_only=True) as existing:
