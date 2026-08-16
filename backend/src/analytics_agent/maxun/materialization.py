@@ -422,6 +422,7 @@ def _lock(path: Path) -> Iterator[None]:
     import fcntl
 
     path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
     with path.open("r+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -466,6 +467,7 @@ class Materializer:
         )
         self.root = Path(root or configured_root or default_root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.root.chmod(0o700)
 
     def _paths(self, workspace_id: str) -> tuple[Path, Path, Path]:
         workspace = str(_uuid(workspace_id))
@@ -482,6 +484,7 @@ class Materializer:
         digest = input_digest(request)
         directory, final, lock_path = self._paths(request.workspace.id)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
         with _lock(lock_path):
             if final.exists():
                 try:
