@@ -247,6 +247,19 @@ def test_overflow_and_mixed_timestamp_fallbacks_preserve_original_text(tmp_path:
     assert by_name["Mixed"]["duckdbType"] == "VARCHAR"
 
 
+def test_unusual_sql_identifiers_are_quoted_and_queryable(tmp_path: Path):
+    columns = ["SELECT", "Product Name", 'a"b', "Prüfung", "123abc"]
+    row = {column: f"value-{index}" for index, column in enumerate(columns)}
+    request = MaterializationRequest.model_validate(payload(columns=columns, rows=[row]))
+    Materializer(tmp_path).materialize(request)
+    database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        result = connection.execute(
+            'SELECT "SELECT", "Product Name", "a""b", "Prüfung", "123abc" FROM data'
+        ).fetchone()
+    assert result == tuple(row[column] for column in columns)
+
+
 def test_null_byte_identifier_is_deterministically_mapped(tmp_path: Path):
     columns = ["unsafe\x00name"]
     request = MaterializationRequest.model_validate(
