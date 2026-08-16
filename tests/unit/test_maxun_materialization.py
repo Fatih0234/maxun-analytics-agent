@@ -6,6 +6,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from analytics_agent.api import maxun_materialization as maxun_api
 from analytics_agent.maxun.materialization import (
     MaterializationError,
     MaterializationRequest,
@@ -14,6 +15,8 @@ from analytics_agent.maxun.materialization import (
     authorize_token,
     input_digest,
 )
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 IDS = {
@@ -228,6 +231,27 @@ def test_duckdb_external_access_and_extensions_are_disabled():
         with pytest.raises(duckdb.Error):
             connection.execute(statement)
     connection.close()
+
+
+def test_internal_http_route_enforces_token_and_returns_bounded_response(
+    tmp_path: Path, monkeypatch
+):
+    app = FastAPI()
+    app.include_router(maxun_api.router)
+    monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", "internal-secret")
+    monkeypatch.setattr(maxun_api, "_materializer", Materializer(tmp_path))
+    body = payload()
+    with TestClient(app) as client:
+        unauthorized = client.put(f"/internal/maxun/materializations/{IDS['workspace']}", json=body)
+        assert unauthorized.status_code == 503
+        response = client.put(
+            f"/internal/maxun/materializations/{IDS['workspace']}",
+            headers={"Authorization": "Bearer internal-secret"},
+            json=body,
+        )
+    assert response.status_code == 200
+    assert response.json()["relation"] == "data"
+    assert "workspace.duckdb" not in response.text
 
 
 def test_authorization_fails_closed(monkeypatch):
