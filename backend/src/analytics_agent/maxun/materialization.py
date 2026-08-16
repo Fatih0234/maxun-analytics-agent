@@ -314,8 +314,9 @@ def _type_and_rule(values: list[Any], hint: str) -> tuple[str, str]:
     if hint in {"number", "numeric", "float", "decimal", "price"}:
         try:
             nums = [_strict_number(value) for value in nonnull]
-            if all(n is not None and n == n.to_integral_value() for n in nums):
-                if all(-(2**63) <= n < 2**63 for n in nums):
+            integral = [n for n in nums if n is not None and n == n.to_integral_value()]
+            if len(integral) == len(nums):
+                if all(-(2**63) <= n < 2**63 for n in integral):
                     return "BIGINT", "strict-number"
                 return "VARCHAR", "number-overflow-varchar"
             if all(n is not None for n in nums):
