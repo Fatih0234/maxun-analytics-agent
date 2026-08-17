@@ -242,6 +242,43 @@ async def test_resumable_turn_events_replay_from_sequence(app_and_db):
 
 
 @pytest.mark.asyncio
+async def test_resumable_turn_rejects_maxun_turn_id_reuse(app_and_db):
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+    turn_id = "99999999-9999-4999-8999-999999999994"
+    body = {
+        "maxun_turn_id": turn_id,
+        "workspace_id": WORKSPACE_ID,
+        "workspace_version": 1,
+        "data_signature": SIGNATURE,
+        "question": "How many rows?",
+    }
+    await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}",
+        headers=headers,
+        json=body,
+    )
+    reused = await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}",
+        headers=headers,
+        json={**body, "question": "What is the total?"},
+    )
+    assert reused.status_code == 409
+    assert reused.json()["detail"]["code"] == "MAXUN_TURN_ID_REUSED"
+
+
+@pytest.mark.asyncio
 async def test_resumable_turn_cancel_is_idempotent_and_terminal(app_and_db, monkeypatch):
     async def slow_events(**kwargs):
         await asyncio.sleep(0.2)
