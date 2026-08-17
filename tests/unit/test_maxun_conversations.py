@@ -479,6 +479,202 @@ async def test_resumable_turn_cancel_is_idempotent_and_terminal(app_and_db, monk
 
 
 @pytest.mark.asyncio
+async def test_cancel_missing_agent_turn_is_idempotent(app_and_db):
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    missing_turn = "99999999-9999-4999-8999-999999999987"
+    cancelled = await _request(
+        app_and_db,
+        "POST",
+        f"/internal/maxun/conversations/{created.json()['conversation_id']}/turns/{missing_turn}/cancel",
+        headers=headers,
+        json={
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+        },
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_terminal_agent_turn_is_rewritten_when_maxun_cancellation_arrives(app_and_db):
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+    turn_id = "99999999-9999-4999-8999-999999999986"
+    completed = await _request(
+        app_and_db,
+        "POST",
+        f"/internal/maxun/conversations/{conversation_id}/turns",
+        headers=headers,
+        json={
+            "maxun_turn_id": turn_id,
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+            "question": "How many rows?",
+        },
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+
+    cancelled = await _request(
+        app_and_db,
+        "POST",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}/cancel",
+        headers=headers,
+        json={
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+        },
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+    events = await _request(
+        app_and_db,
+        "GET",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}/events?after=0",
+        headers=headers,
+    )
+    assert events.json()["status"] == "cancelled"
+    assert [event["type"] for event in events.json()["events"]].count("turn.completed") == 0
+    assert events.json()["events"][-1]["type"] == "turn.cancelled"
+
+    from analytics_agent.agent.history import build_history
+    from analytics_agent.db.models import Message
+    from sqlalchemy import select
+
+    async with adapter._get_session_factory()() as session:
+        messages = list(
+            (
+                await session.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.sequence)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    history = build_history(messages, "What should run next?")
+    assert [message.type for message in history] == ["human"]
+    assert history[0].content == "What should run next?"
+
+
+@pytest.mark.asyncio
+async def test_cancel_stops_old_execution_before_same_conversation_turn(app_and_db, monkeypatch):
+    started = asyncio.Event()
+    release_second = asyncio.Event()
+    active = 0
+    max_active = 0
+    calls = 0
+
+    async def tracked_events(**kwargs):
+        nonlocal active, max_active, calls
+        calls += 1
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            if calls == 1:
+                started.set()
+                await asyncio.Event().wait()
+            else:
+                release_second.set()
+                yield {
+                    "event": "SQL",
+                    "payload": {
+                        "sql": "SELECT COUNT(*) FROM data",
+                        "columns": ["count"],
+                        "rows": [{"count": 2}],
+                    },
+                }
+                yield {"event": "TEXT", "payload": {"text": "There are 2 rows."}}
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(adapter, "stream_graph_events", tracked_events)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+    first_id = "99999999-9999-4999-8999-999999999985"
+    first_body = {
+        "maxun_turn_id": first_id,
+        "workspace_id": WORKSPACE_ID,
+        "workspace_version": 1,
+        "data_signature": SIGNATURE,
+        "question": "First question",
+    }
+    accepted = await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{first_id}",
+        headers=headers,
+        json=first_body,
+    )
+    assert accepted.status_code == 200
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    cancelled = await _request(
+        app_and_db,
+        "POST",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{first_id}/cancel",
+        headers=headers,
+        json={
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+        },
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+    second_id = "99999999-9999-4999-8999-999999999984"
+    second = await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{second_id}",
+        headers=headers,
+        json={**first_body, "maxun_turn_id": second_id, "question": "Second question"},
+    )
+    assert second.status_code == 200
+    await asyncio.wait_for(release_second.wait(), timeout=1)
+    for _ in range(20):
+        status = await _request(
+            app_and_db,
+            "GET",
+            f"/internal/maxun/conversations/{conversation_id}/turns/{second_id}/events?after=0",
+            headers=headers,
+        )
+        if status.json()["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+    assert status.json()["status"] == "completed"
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
 async def test_turn_history_messages_are_correlated_once(app_and_db):
     headers = {"Authorization": f"Bearer {TOKEN}"}
     created = await _request(

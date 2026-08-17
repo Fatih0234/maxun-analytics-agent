@@ -77,6 +77,7 @@ _PUBLIC_EVENT_TYPES = {
 # database state remain the public authority.
 _turn_locks: dict[str, Any] = {}
 _turn_write_locks: dict[str, Any] = {}
+_conversation_execution_locks: dict[str, Any] = {}
 _turn_tasks: dict[str, asyncio.Task[Any]] = {}
 _turn_capacity = asyncio.Semaphore(_MAX_TURN_CONCURRENCY)
 _active_engines: dict[str, Any] = {}
@@ -194,6 +195,26 @@ def _write_lock_for(turn_record_id: str):
         lock = asyncio.Lock()
         _turn_write_locks[turn_record_id] = lock
     return lock
+
+
+def _conversation_execution_lock_for(conversation_id: str):
+    import asyncio
+
+    lock = _conversation_execution_locks.get(conversation_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _conversation_execution_locks[conversation_id] = lock
+    return lock
+
+
+async def _stop_turn_task(turn_record_id: str) -> None:
+    task = _turn_tasks.get(turn_record_id)
+    current = asyncio.current_task()
+    if task is None or task is current or task.done():
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
 
 
 def _maybe_drop_lock(registry: dict[str, Any], key: str, lock: asyncio.Lock) -> None:
@@ -1050,6 +1071,11 @@ async def _run_turn_with_deadline(
     timeout_seconds = max(0.01, float(settings.maxun_turn_runtime_seconds))
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+    except asyncio.CancelledError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        raise
     except TimeoutError:
         engine = _active_engines.get(turn_record_id)
         if engine is not None:
@@ -1071,8 +1097,9 @@ async def _background_turn(
     turn_record_id: str,
     recovered: bool,
 ) -> None:
+    execution_lock = _conversation_execution_lock_for(conversation_id)
     try:
-        async with _turn_capacity:
+        async with _turn_capacity, execution_lock:
             await _run_turn_with_deadline(
                 conversation_id,
                 request,
@@ -1090,6 +1117,7 @@ async def _background_turn(
         write_lock = _turn_write_locks.get(turn_record_id)
         if write_lock is not None:
             _maybe_drop_lock(_turn_write_locks, turn_record_id, write_lock)
+        _maybe_drop_lock(_conversation_execution_locks, conversation_id, execution_lock)
 
 
 def _schedule_turn(
@@ -1209,7 +1237,9 @@ async def cancel_turn(
         )
         record_id = record_result.scalar_one_or_none()
     if record_id is None:
-        raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
+        # Cancellation is idempotent even if Maxun committed cancellation
+        # before this Agent process created the durable Agent turn.
+        return _cancelled_result()
 
     lock = _write_lock_for(record_id)
     async with lock, factory() as session:
@@ -1223,6 +1253,7 @@ async def cancel_turn(
         if record is None:
             raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
         result = _stored_turn_result(record)
+        stop_task = False
         if record.status == "processing":
             result = _cancelled_result()
             now = datetime.now(UTC)
@@ -1232,6 +1263,59 @@ async def cancel_turn(
             record.finished_at = now
             record.updated_at = now
             _append_event_in_session(session, record, "turn.cancelled", result)
+            stop_task = True
+            await session.commit()
+        elif record.status in {"completed", "error"}:
+            # Maxun is authoritative once it has committed cancellation. If
+            # the Agent completed first but Maxun had not yet projected that
+            # event, rewrite the Agent terminal snapshot and history marker so
+            # the cancelled exchange cannot re-enter a later prompt.
+            result = _cancelled_result()
+            now = datetime.now(UTC)
+            record.cancel_requested_at = now
+            record.status = "cancelled"
+            record.result_json = orjson.dumps(result).decode()
+            record.finished_at = now
+            record.updated_at = now
+            terminal_result = await session.execute(
+                select(MaxunTurnEvent)
+                .where(
+                    MaxunTurnEvent.turn_record_id == record.id,
+                    MaxunTurnEvent.event_type.in_(_TERMINAL_EVENT_TYPES),
+                )
+                .order_by(MaxunTurnEvent.sequence.desc())
+                .limit(1)
+            )
+            terminal_event = terminal_result.scalar_one_or_none()
+            if terminal_event is not None:
+                terminal_event.event_type = "turn.cancelled"
+                terminal_event.payload = _encoded_event_payload(result)
+            else:
+                _append_event_in_session(session, record, "turn.cancelled", result)
+            message_result = await session.execute(
+                select(Message)
+                .where(
+                    Message.conversation_id == conversation_id,
+                    Message.maxun_turn_record_id == record.id,
+                    Message.event_type == "MAXUN_RESULT",
+                    Message.role == "assistant",
+                )
+                .order_by(Message.sequence.desc())
+                .limit(1)
+            )
+            message = message_result.scalar_one_or_none()
+            if message is not None:
+                message.payload = orjson.dumps(
+                    {
+                        "status": result["status"],
+                        "answer": result["answer"],
+                        "sql": result["sql"],
+                        "columns": result["columns"],
+                        "rows": result["rows"],
+                        "truncated": result["truncated"],
+                    }
+                ).decode()
+            stop_task = True
             await session.commit()
         else:
             await session.rollback()
@@ -1241,6 +1325,8 @@ async def cancel_turn(
         if callable(cancel_active):
             with contextlib.suppress(Exception):
                 await cancel_active()
+    if stop_task:
+        await _stop_turn_task(record_id)
     write_lock = _turn_write_locks.get(record_id)
     if write_lock is not None:
         _maybe_drop_lock(_turn_write_locks, record_id, write_lock)
@@ -1263,11 +1349,13 @@ async def create_turn(
     lock = _lock_for(conversation_id)
     if lock.locked():
         raise HTTPException(status_code=409, detail={"code": "MAXUN_TURN_IN_PROGRESS"})
+    execution_lock = _conversation_execution_lock_for(conversation_id)
     try:
-        async with lock:
+        async with lock, execution_lock:
             return await _run_turn(conversation_id, body)
     finally:
         _maybe_drop_lock(_turn_locks, conversation_id, lock)
+        _maybe_drop_lock(_conversation_execution_locks, conversation_id, execution_lock)
 
 
 __all__ = ["router"]
