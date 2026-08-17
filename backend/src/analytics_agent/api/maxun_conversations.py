@@ -47,6 +47,19 @@ _MAX_ANSWER_CHARS = 12_000
 _MAX_QUESTION_CHARS = 4_000
 _MAXUN_TURN_PROCESSING_TTL_SECONDS = 15 * 60
 _MAX_EVENT_PAYLOAD_BYTES = 256 * 1024
+
+
+def _turn_concurrency_from_env() -> int:
+    try:
+        value = int(os.environ.get("MAXUN_TURN_CONCURRENCY", "2"))
+    except ValueError as error:
+        raise ValueError("MAXUN_TURN_CONCURRENCY must be an integer") from error
+    if not 1 <= value <= 32:
+        raise ValueError("MAXUN_TURN_CONCURRENCY must be between 1 and 32")
+    return value
+
+
+_MAX_TURN_CONCURRENCY = _turn_concurrency_from_env()
 _PUBLIC_EVENT_TYPES = {
     "turn.started",
     "turn.reset",
@@ -62,6 +75,7 @@ _PUBLIC_EVENT_TYPES = {
 # database state remain the public authority.
 _turn_locks: dict[str, Any] = {}
 _turn_tasks: dict[str, asyncio.Task[Any]] = {}
+_turn_capacity = asyncio.Semaphore(_MAX_TURN_CONCURRENCY)
 _active_engines: dict[str, Any] = {}
 
 
@@ -832,12 +846,13 @@ async def _background_turn(
     recovered: bool,
 ) -> None:
     try:
-        await _run_turn(
-            conversation_id,
-            request,
-            turn_record_id=turn_record_id,
-            recovered=recovered,
-        )
+        async with _turn_capacity:
+            await _run_turn(
+                conversation_id,
+                request,
+                turn_record_id=turn_record_id,
+                recovered=recovered,
+            )
     except Exception as error:
         logger.info("Maxun background turn stopped: %s", type(error).__name__)
     finally:
