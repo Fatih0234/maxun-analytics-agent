@@ -18,7 +18,11 @@ def _get_engine():
         is_asyncpg = "asyncpg" in url
         connect_args: dict = {}
         if is_sqlite:
-            connect_args = {"check_same_thread": False}
+            # The supported Maxun deployment uses one Agent replica with
+            # persistent SQLite. Give short concurrent event/cancel writers
+            # time to observe the serialized process-local turn lock rather
+            # than failing immediately with SQLITE_BUSY.
+            connect_args = {"check_same_thread": False, "timeout": 30}
         elif is_asyncpg and settings.db_command_timeout > 0:
             # Bound every statement (including pool_pre_ping's SELECT 1) so a
             # connection wedged by task cancellation fails fast instead of

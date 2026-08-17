@@ -47,6 +47,8 @@ _MAX_ANSWER_CHARS = 12_000
 _MAX_QUESTION_CHARS = 4_000
 _MAXUN_TURN_PROCESSING_TTL_SECONDS = 15 * 60
 _MAX_EVENT_PAYLOAD_BYTES = 256 * 1024
+_MAX_EVENTS_PER_TURN = 512
+_TERMINAL_EVENT_TYPES = {"turn.completed", "turn.failed", "turn.cancelled"}
 
 
 def _turn_concurrency_from_env() -> int:
@@ -74,6 +76,7 @@ _PUBLIC_EVENT_TYPES = {
 # duplicate in-flight turns inside one Agent process; Maxun's idempotency and
 # database state remain the public authority.
 _turn_locks: dict[str, Any] = {}
+_turn_write_locks: dict[str, Any] = {}
 _turn_tasks: dict[str, asyncio.Task[Any]] = {}
 _turn_capacity = asyncio.Semaphore(_MAX_TURN_CONCURRENCY)
 _active_engines: dict[str, Any] = {}
@@ -158,10 +161,13 @@ def _new_message(
     role: str,
     payload: dict[str, Any],
     sequence: int,
+    *,
+    turn_record_id: str | None = None,
 ) -> Message:
     return Message(
         id=str(uuid.uuid4()),
         conversation_id=conversation_id,
+        maxun_turn_record_id=turn_record_id,
         event_type=event_type,
         role=role,
         payload=orjson.dumps(payload).decode(),
@@ -178,6 +184,26 @@ def _lock_for(conversation_id: str):
         lock = asyncio.Lock()
         _turn_locks[conversation_id] = lock
     return lock
+
+
+def _write_lock_for(turn_record_id: str):
+    import asyncio
+
+    lock = _turn_write_locks.get(turn_record_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _turn_write_locks[turn_record_id] = lock
+    return lock
+
+
+def _maybe_drop_lock(registry: dict[str, Any], key: str, lock: asyncio.Lock) -> None:
+    """Drop an idle lock without racing a waiter that is queued on it."""
+    if registry.get(key) is not lock or lock.locked():
+        return
+    waiters = getattr(lock, "_waiters", None)
+    if waiters:
+        return
+    registry.pop(key, None)
 
 
 async def _mock_maxun_events(
@@ -241,11 +267,74 @@ def _configure_maxun_turn_budget(engine: Any) -> None:
 def _encoded_event_payload(payload: dict[str, Any]) -> str:
     try:
         encoded = orjson.dumps(payload)
-    except Exception:
-        encoded = b'{"error":"The workspace question could not be completed"}'
+    except Exception as error:
+        raise MaxunQueryError(
+            "MAXUN_RESULT_LIMIT",
+            "The workspace event could not be represented safely",
+        ) from error
     if len(encoded) > _MAX_EVENT_PAYLOAD_BYTES:
-        encoded = b'{"error":"The workspace event was too large"}'
+        raise MaxunQueryError(
+            "MAXUN_RESULT_LIMIT",
+            "The workspace event is too large",
+        )
     return encoded.decode()
+
+
+def _bounded_public_result(
+    payload: dict[str, Any],
+    *,
+    answer_budget: str,
+) -> dict[str, Any]:
+    """Return one result shape that fits both public Agent event envelopes.
+
+    Query results are bounded before they enter either the in-memory terminal
+    reducer or the durable event ledger. The answer budget is deliberately
+    conservative when called for a query event so a later terminal event can
+    carry the same rows without exceeding the envelope.
+    """
+    sql = payload.get("sql") if isinstance(payload.get("sql"), str) else None
+    source_columns = payload.get("columns", [])
+    if not isinstance(source_columns, list):
+        source_columns = []
+    columns = [column for column in source_columns if isinstance(column, str)][:100]
+    source_rows = payload.get("rows", [])
+    if not isinstance(source_rows, list):
+        source_rows = []
+    rows = [row for row in source_rows if isinstance(row, dict)][:500]
+    truncated = bool(payload.get("truncated", False)) or len(source_rows) > len(rows)
+
+    def fits(candidate_rows: list[dict[str, Any]], candidate_truncated: bool) -> bool:
+        query = {
+            "sql": sql,
+            "columns": columns,
+            "rows": candidate_rows,
+            "truncated": candidate_truncated,
+        }
+        terminal = {
+            "status": "completed",
+            "answer": answer_budget,
+            **query,
+            "error": None,
+        }
+        return (
+            len(orjson.dumps(query)) <= _MAX_EVENT_PAYLOAD_BYTES
+            and len(orjson.dumps(terminal)) <= _MAX_EVENT_PAYLOAD_BYTES
+        )
+
+    while rows and not fits(rows, truncated):
+        rows.pop()
+        truncated = True
+    if not fits(rows, truncated):
+        raise MaxunQueryError(
+            "MAXUN_RESULT_LIMIT",
+            "The workspace result is too large",
+        )
+    return {
+        "sql": sql,
+        "columns": columns,
+        "rows": rows,
+        "truncated": truncated,
+    }
 
 
 def _append_event_in_session(
@@ -257,6 +346,10 @@ def _append_event_in_session(
     if event_type not in _PUBLIC_EVENT_TYPES:
         return
     sequence = max(1, int(turn.next_event_sequence or 1))
+    if sequence > _MAX_EVENTS_PER_TURN or (
+        sequence == _MAX_EVENTS_PER_TURN and event_type not in _TERMINAL_EVENT_TYPES
+    ):
+        raise MaxunQueryError("MAXUN_EVENT_LIMIT", "The workspace event limit was reached")
     turn.next_event_sequence = sequence + 1
     turn.updated_at = datetime.now(UTC)
     session.add(
@@ -278,13 +371,15 @@ async def _append_turn_event(
 ) -> None:
     if event_type not in _PUBLIC_EVENT_TYPES:
         return
-    factory = _get_session_factory()
-    async with factory() as session:
-        await MaxunTurnRepo(session).append_event(
-            turn_record_id,
-            event_type,
-            _encoded_event_payload(payload),
-        )
+    lock = _write_lock_for(turn_record_id)
+    async with lock:
+        factory = _get_session_factory()
+        async with factory() as session:
+            await MaxunTurnRepo(session).append_event(
+                turn_record_id,
+                event_type,
+                _encoded_event_payload(payload),
+            )
 
 
 async def _turn_is_cancel_requested(turn_record_id: str) -> bool:
@@ -295,25 +390,29 @@ async def _turn_is_cancel_requested(turn_record_id: str) -> bool:
 
 
 async def _mark_turn_started(turn_record_id: str, attempt: int, recovered: bool) -> None:
-    factory = _get_session_factory()
-    async with factory() as session:
-        turn = await MaxunTurnRepo(session).get_by_id(turn_record_id)
-        if turn is None or turn.status != "processing":
-            return
-        turn.started_at = datetime.now(UTC)
-        turn.updated_at = datetime.now(UTC)
-        await session.commit()
-    if recovered:
-        await _append_turn_event(
-            turn_record_id,
-            "turn.reset",
-            {"attempt": attempt, "reason": "execution_recovered"},
-        )
-    await _append_turn_event(
-        turn_record_id,
-        "turn.started",
-        {"attempt": attempt},
-    )
+    lock = _write_lock_for(turn_record_id)
+    async with lock:
+        factory = _get_session_factory()
+        async with factory() as session:
+            turn = await MaxunTurnRepo(session).get_by_id(turn_record_id)
+            if turn is None or turn.status != "processing" or turn.cancel_requested_at is not None:
+                return
+            turn.started_at = datetime.now(UTC)
+            turn.updated_at = datetime.now(UTC)
+            if recovered:
+                _append_event_in_session(
+                    session,
+                    turn,
+                    "turn.reset",
+                    {"attempt": attempt, "reason": "execution_recovered"},
+                )
+            _append_event_in_session(
+                session,
+                turn,
+                "turn.started",
+                {"attempt": attempt},
+            )
+            await session.commit()
 
 
 def _cancelled_result() -> dict[str, Any]:
@@ -494,6 +593,73 @@ async def _ensure_turn_record(
         return maxun_turn, None, False
 
 
+async def _commit_turn_result(
+    session: Any,
+    conversation_id: str,
+    turn_record_id: str,
+    result: dict[str, Any],
+    sequence: int,
+) -> dict[str, Any]:
+    locked_result = await session.execute(
+        select(MaxunTurn)
+        .where(MaxunTurn.id == turn_record_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    locked_turn = locked_result.scalar_one_or_none()
+    if locked_turn is None:
+        raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
+    if locked_turn.status != "processing":
+        existing_result = _stored_turn_result(locked_turn)
+        await session.rollback()
+        return existing_result or _cancelled_result()
+    if locked_turn.cancel_requested_at is not None:
+        result = _cancelled_result()
+    locked_turn.status = result["status"]
+    locked_turn.result_json = orjson.dumps(result).decode()
+    locked_turn.finished_at = datetime.now(UTC)
+    locked_turn.updated_at = datetime.now(UTC)
+    terminal_event = {
+        "completed": "turn.completed",
+        "error": "turn.failed",
+        "cancelled": "turn.cancelled",
+    }.get(result["status"])
+    if terminal_event:
+        _append_event_in_session(
+            session,
+            locked_turn,
+            terminal_event,
+            {
+                "status": result["status"],
+                "answer": result["answer"],
+                "sql": result["sql"],
+                "columns": result["columns"],
+                "rows": result["rows"],
+                "truncated": result["truncated"],
+                "error": result.get("error"),
+            },
+        )
+    session.add(
+        _new_message(
+            conversation_id,
+            "MAXUN_RESULT",
+            "assistant",
+            {
+                "status": result["status"],
+                "answer": result["answer"],
+                "sql": result["sql"],
+                "columns": result["columns"],
+                "rows": result["rows"],
+                "truncated": result["truncated"],
+            },
+            sequence,
+            turn_record_id=locked_turn.id,
+        )
+    )
+    await session.commit()
+    return result
+
+
 async def _run_turn(
     conversation_id: str,
     request: MaxunTurnRequest,
@@ -540,9 +706,22 @@ async def _run_turn(
 
         turn_record_id = maxun_turn.id
         message_repo = MessageRepo(session)
-        prior_messages = await message_repo.list_for_conversation(conversation_id)
-        sequence = len(prior_messages)
-        if not recovered:
+        all_messages = await message_repo.list_for_conversation(conversation_id)
+        prior_messages = [
+            message for message in all_messages if message.maxun_turn_record_id != maxun_turn.id
+        ]
+        sequence = len(all_messages)
+        current_user_message = next(
+            (
+                message
+                for message in all_messages
+                if message.maxun_turn_record_id == maxun_turn.id
+                and message.event_type == "TEXT"
+                and message.role == "user"
+            ),
+            None,
+        )
+        if current_user_message is None:
             session.add(
                 _new_message(
                     conversation_id,
@@ -550,6 +729,7 @@ async def _run_turn(
                     "user",
                     {"text": request.question.strip()},
                     sequence,
+                    turn_record_id=maxun_turn.id,
                 )
             )
             sequence += 1
@@ -631,20 +811,21 @@ async def _run_turn(
                         "message_id": str(uuid.uuid4()),
                         "payload": {"error": "The workspace question could not be completed"},
                     }
-                events.append(event)
                 if event_type == "SQL":
                     payload = event.get("payload")
                     if isinstance(payload, dict) and isinstance(payload.get("sql"), str):
+                        bounded = _bounded_public_result(
+                            payload,
+                            # Reserve the maximum UTF-8 answer envelope so
+                            # the later terminal event can carry these rows.
+                            answer_budget="x" * (_MAX_ANSWER_CHARS * 4),
+                        )
+                        event = {**event, "payload": bounded}
                         successful_sql_seen = True
                         await _append_turn_event(
                             maxun_turn.id,
                             "query.result",
-                            {
-                                "sql": payload.get("sql"),
-                                "columns": payload.get("columns", []),
-                                "rows": payload.get("rows", []),
-                                "truncated": bool(payload.get("truncated", False)),
-                            },
+                            bounded,
                         )
                 elif event_type == "TEXT" and successful_sql_seen:
                     payload = event.get("payload")
@@ -654,6 +835,7 @@ async def _run_turn(
                         ]
                         if len(pending_answer_delta.encode()) >= 4096:
                             await flush_answer_delta()
+                events.append(event)
                 # Partial Agent events belong to the durable turn-event ledger,
                 # not conversation history. Only the final MAXUN_RESULT below
                 # becomes prompt history, so a recovered attempt cannot feed
@@ -676,71 +858,39 @@ async def _run_turn(
                     await engine.aclose()
 
         result = _cancelled_result() if cancellation_requested else _result_from_events(events)
+        if result["status"] == "completed":
+            try:
+                bounded_result = _bounded_public_result(
+                    result,
+                    answer_budget=result["answer"],
+                )
+                result.update(bounded_result)
+            except MaxunQueryError as error:
+                result = {
+                    "status": "error",
+                    "answer": "",
+                    "sql": None,
+                    "columns": [],
+                    "rows": [],
+                    "truncated": False,
+                    "error": {
+                        "code": error.code,
+                        "message": "The workspace question could not be completed",
+                    },
+                }
         if result["status"] == "error":
             result["error"] = result.get("error") or {
                 "code": "MAXUN_TURN_FAILED",
                 "message": "The workspace question could not be completed",
             }
-        locked_result = await session.execute(
-            select(MaxunTurn)
-            .where(MaxunTurn.id == maxun_turn.id)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
-        locked_turn = locked_result.scalar_one_or_none()
-        if locked_turn is None:
-            raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
-        if locked_turn.status != "processing":
-            existing_result = _stored_turn_result(locked_turn)
-            await session.rollback()
-            return existing_result or _cancelled_result()
-        if locked_turn.cancel_requested_at is not None:
-            result = _cancelled_result()
-        locked_turn.status = result["status"]
-        locked_turn.result_json = orjson.dumps(result).decode()
-        locked_turn.finished_at = datetime.now(UTC)
-        locked_turn.updated_at = datetime.now(UTC)
-        maxun_turn = locked_turn
-        terminal_event = {
-            "completed": "turn.completed",
-            "error": "turn.failed",
-            "cancelled": "turn.cancelled",
-        }.get(result["status"])
-        if terminal_event:
-            _append_event_in_session(
+        async with _write_lock_for(maxun_turn.id):
+            return await _commit_turn_result(
                 session,
-                maxun_turn,
-                terminal_event,
-                {
-                    "status": result["status"],
-                    "answer": result["answer"],
-                    "sql": result["sql"],
-                    "columns": result["columns"],
-                    "rows": result["rows"],
-                    "truncated": result["truncated"],
-                    "error": result.get("error"),
-                },
-            )
-        session.add(
-            # Touching the row here avoids a second commit through the generic
-            # repository and keeps the turn's history atomic.
-            _new_message(
                 conversation_id,
-                "MAXUN_RESULT",
-                "assistant",
-                {
-                    "status": result["status"],
-                    "answer": result["answer"],
-                    "sql": result["sql"],
-                    "columns": result["columns"],
-                    "rows": result["rows"],
-                    "truncated": result["truncated"],
-                },
+                maxun_turn.id,
+                result,
                 sequence,
             )
-        )
-        await session.commit()
-        return result
 
 
 @router.post("", status_code=201)
@@ -811,7 +961,7 @@ async def delete_conversation(
                     )
                 await repo.delete(conversation_id)
     finally:
-        _turn_locks.pop(conversation_id, None)
+        _maybe_drop_lock(_turn_locks, conversation_id, lock)
 
 
 def _turn_status_payload(
@@ -827,6 +977,94 @@ def _turn_status_payload(
     }
 
 
+async def _persist_terminal_failure(turn_record_id: str, code: str) -> None:
+    lock = _write_lock_for(turn_record_id)
+    async with lock:
+        factory = _get_session_factory()
+        async with factory() as session:
+            locked_result = await session.execute(
+                select(MaxunTurn)
+                .where(MaxunTurn.id == turn_record_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            turn = locked_result.scalar_one_or_none()
+            if turn is None or turn.status != "processing":
+                await session.rollback()
+                return
+            result = (
+                _cancelled_result()
+                if turn.cancel_requested_at is not None
+                else {
+                    "status": "error",
+                    "answer": "",
+                    "sql": None,
+                    "columns": [],
+                    "rows": [],
+                    "truncated": False,
+                    "error": {
+                        "code": code,
+                        "message": "The workspace question could not be completed",
+                    },
+                }
+            )
+            turn.status = result["status"]
+            turn.result_json = orjson.dumps(result).decode()
+            turn.finished_at = datetime.now(UTC)
+            turn.updated_at = datetime.now(UTC)
+            _append_event_in_session(
+                session,
+                turn,
+                {
+                    "completed": "turn.completed",
+                    "error": "turn.failed",
+                    "cancelled": "turn.cancelled",
+                }[result["status"]],
+                {
+                    "status": result["status"],
+                    "answer": result["answer"],
+                    "sql": result["sql"],
+                    "columns": result["columns"],
+                    "rows": result["rows"],
+                    "truncated": result["truncated"],
+                    "error": result.get("error"),
+                },
+            )
+            await session.commit()
+
+
+async def _run_turn_with_deadline(
+    conversation_id: str,
+    request: MaxunTurnRequest,
+    turn_record_id: str,
+    recovered: bool,
+) -> None:
+    task = asyncio.create_task(
+        _run_turn(
+            conversation_id,
+            request,
+            turn_record_id=turn_record_id,
+            recovered=recovered,
+        )
+    )
+    timeout_seconds = max(0.01, float(settings.maxun_turn_runtime_seconds))
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+    except TimeoutError:
+        engine = _active_engines.get(turn_record_id)
+        if engine is not None:
+            cancel_active = getattr(engine, "cancel_active", None)
+            if callable(cancel_active):
+                with contextlib.suppress(Exception):
+                    await cancel_active()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        await _persist_terminal_failure(turn_record_id, "MAXUN_TURN_TIMEOUT")
+    else:
+        await task
+
+
 async def _background_turn(
     conversation_id: str,
     request: MaxunTurnRequest,
@@ -835,18 +1073,23 @@ async def _background_turn(
 ) -> None:
     try:
         async with _turn_capacity:
-            await _run_turn(
+            await _run_turn_with_deadline(
                 conversation_id,
                 request,
-                turn_record_id=turn_record_id,
-                recovered=recovered,
+                turn_record_id,
+                recovered,
             )
     except Exception as error:
         logger.info("Maxun background turn stopped: %s", type(error).__name__)
+        with contextlib.suppress(Exception):
+            await _persist_terminal_failure(turn_record_id, "MAXUN_TURN_FAILED")
     finally:
         current = asyncio.current_task()
         if _turn_tasks.get(turn_record_id) is current:
             _turn_tasks.pop(turn_record_id, None)
+        write_lock = _turn_write_locks.get(turn_record_id)
+        if write_lock is not None:
+            _maybe_drop_lock(_turn_write_locks, turn_record_id, write_lock)
 
 
 def _schedule_turn(
@@ -958,18 +1201,27 @@ async def cancel_turn(
         conversation = await ConversationRepo(session).get(conversation_id)
         if conversation is None or conversation.engine_name != f"maxun:{body.workspace_id}":
             raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
-        locked_result = await session.execute(
-            select(MaxunTurn)
-            .where(
+        record_result = await session.execute(
+            select(MaxunTurn.id).where(
                 MaxunTurn.conversation_id == conversation_id,
                 MaxunTurn.maxun_turn_id == maxun_turn_id,
             )
-            .with_for_update()
+        )
+        record_id = record_result.scalar_one_or_none()
+    if record_id is None:
+        raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
+
+    lock = _write_lock_for(record_id)
+    async with lock, factory() as session:
+        conversation = await ConversationRepo(session).get(conversation_id)
+        if conversation is None or conversation.engine_name != f"maxun:{body.workspace_id}":
+            raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
+        locked_result = await session.execute(
+            select(MaxunTurn).where(MaxunTurn.id == record_id).with_for_update()
         )
         record = locked_result.scalar_one_or_none()
         if record is None:
             raise HTTPException(status_code=404, detail={"code": "MAXUN_TURN_NOT_FOUND"})
-        record_id = record.id
         result = _stored_turn_result(record)
         if record.status == "processing":
             result = _cancelled_result()
@@ -989,6 +1241,9 @@ async def cancel_turn(
         if callable(cancel_active):
             with contextlib.suppress(Exception):
                 await cancel_active()
+    write_lock = _turn_write_locks.get(record_id)
+    if write_lock is not None:
+        _maybe_drop_lock(_turn_write_locks, record_id, write_lock)
     return result or _cancelled_result()
 
 
@@ -1012,7 +1267,7 @@ async def create_turn(
         async with lock:
             return await _run_turn(conversation_id, body)
     finally:
-        _turn_locks.pop(conversation_id, None)
+        _maybe_drop_lock(_turn_locks, conversation_id, lock)
 
 
 __all__ = ["router"]

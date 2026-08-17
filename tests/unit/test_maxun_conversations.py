@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
+import orjson
 import pytest
 from analytics_agent.api import maxun_conversations as adapter
 from analytics_agent.db.models import Base
@@ -279,6 +281,54 @@ async def test_resumable_turn_rejects_maxun_turn_id_reuse(app_and_db):
 
 
 @pytest.mark.asyncio
+async def test_answer_deltas_are_coalesced_before_ledger_persistence(app_and_db, monkeypatch):
+    async def many_text_events(**kwargs):
+        yield {
+            "event": "SQL",
+            "payload": {
+                "sql": "SELECT COUNT(*) FROM data",
+                "columns": ["count"],
+                "rows": [{"count": 20}],
+                "truncated": False,
+            },
+        }
+        for _ in range(20):
+            yield {"event": "TEXT", "payload": {"text": "x"}}
+        yield {"event": "COMPLETE", "payload": {"text": ""}}
+
+    monkeypatch.setattr(adapter, "stream_graph_events", many_text_events)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+    response = await _request(
+        app_and_db,
+        "POST",
+        f"/internal/maxun/conversations/{conversation_id}/turns",
+        headers=headers,
+        json={
+            "maxun_turn_id": "99999999-9999-4999-8999-999999999994",
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+            "question": "How many rows?",
+        },
+    )
+    assert response.status_code == 200
+    async with adapter._get_session_factory()() as session:
+        from analytics_agent.db.models import MaxunTurnEvent
+        from sqlalchemy import select
+
+        event_rows = list((await session.execute(select(MaxunTurnEvent))).scalars().all())
+    assert [row.event_type for row in event_rows].count("answer.delta") == 1
+
+
+@pytest.mark.asyncio
 async def test_resumable_turn_cancel_is_idempotent_and_terminal(app_and_db, monkeypatch):
     async def slow_events(**kwargs):
         await asyncio.sleep(0.2)
@@ -351,6 +401,201 @@ async def test_resumable_turn_cancel_is_idempotent_and_terminal(app_and_db, monk
 
 
 @pytest.mark.asyncio
+async def test_turn_history_messages_are_correlated_once(app_and_db):
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+    turn_id = "99999999-9999-4999-8999-999999999993"
+    response = await _request(
+        app_and_db,
+        "POST",
+        f"/internal/maxun/conversations/{conversation_id}/turns",
+        headers=headers,
+        json={
+            "maxun_turn_id": turn_id,
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+            "question": "How many rows?",
+        },
+    )
+    assert response.status_code == 200
+    factory = adapter._get_session_factory()
+    async with factory() as session:
+        from analytics_agent.db.models import Message
+        from sqlalchemy import select
+
+        rows = list(
+            (
+                await session.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.sequence)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [(row.event_type, row.role) for row in rows] == [
+        ("TEXT", "user"),
+        ("MAXUN_RESULT", "assistant"),
+    ]
+    assert all(row.maxun_turn_record_id for row in rows)
+    assert len({row.maxun_turn_record_id for row in rows}) == 1
+
+    replay = await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}",
+        headers=headers,
+        json={
+            "maxun_turn_id": turn_id,
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+            "question": "How many rows?",
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "completed"
+    async with factory() as session:
+        rows_after_replay = list(
+            (
+                await session.execute(
+                    select(Message).where(Message.conversation_id == conversation_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [(row.event_type, row.role) for row in rows_after_replay] == [
+        ("TEXT", "user"),
+        ("MAXUN_RESULT", "assistant"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_event_appends_are_serialized_by_turn_lock(app_and_db):
+    from analytics_agent.db.models import Conversation, MaxunTurn
+    from sqlalchemy import select
+
+    factory = adapter._get_session_factory()
+    conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    turn_record_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    async with factory() as session:
+        session.add(
+            Conversation(
+                id=conversation_id,
+                title="Sequence test",
+                engine_name=f"maxun:{WORKSPACE_ID}",
+                created_at=adapter.datetime.now(adapter.UTC),
+            )
+        )
+        session.add(
+            MaxunTurn(
+                id=turn_record_id,
+                conversation_id=conversation_id,
+                maxun_turn_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                request_digest="a" * 64,
+                status="processing",
+                next_event_sequence=1,
+                attempt=1,
+            )
+        )
+        await session.commit()
+    await asyncio.gather(
+        *(
+            adapter._append_turn_event(turn_record_id, "answer.delta", {"text": str(index)})
+            for index in range(20)
+        )
+    )
+    async with factory() as session:
+        from analytics_agent.db.models import MaxunTurnEvent
+
+        events = list(
+            (
+                await session.execute(
+                    select(MaxunTurnEvent)
+                    .where(MaxunTurnEvent.turn_record_id == turn_record_id)
+                    .order_by(MaxunTurnEvent.sequence)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [event.sequence for event in events] == list(range(1, 21))
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_timeout_commits_terminal_state(app_and_db, monkeypatch):
+    async def never_finishes(**kwargs):
+        await asyncio.sleep(0.2)
+        yield {
+            "event": "SQL",
+            "payload": {
+                "sql": "SELECT COUNT(*) FROM data",
+                "columns": ["count"],
+                "rows": [{"count": 2}],
+            },
+        }
+
+    monkeypatch.setattr(adapter, "stream_graph_events", never_finishes)
+    previous_timeout = adapter.settings.maxun_turn_runtime_seconds
+    adapter.settings.maxun_turn_runtime_seconds = 0.05
+    try:
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        created = await _request(
+            app_and_db,
+            "POST",
+            "/internal/maxun/conversations",
+            headers=headers,
+            json={
+                "workspace_id": WORKSPACE_ID,
+                "workspace_version": 1,
+                "data_signature": SIGNATURE,
+            },
+        )
+        conversation_id = created.json()["conversation_id"]
+        turn_id = "99999999-9999-4999-8999-999999999992"
+        body = {
+            "maxun_turn_id": turn_id,
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+            "question": "How many rows?",
+        }
+        accepted = await _request(
+            app_and_db,
+            "PUT",
+            f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}",
+            headers=headers,
+            json=body,
+        )
+        assert accepted.status_code == 200
+        for _ in range(30):
+            status = await _request(
+                app_and_db,
+                "GET",
+                f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}/events?after=0",
+                headers=headers,
+            )
+            if status.json()["status"] != "processing":
+                break
+            await asyncio.sleep(0.01)
+        assert status.json()["status"] == "error"
+        assert status.json()["result"]["error"]["code"] == "MAXUN_TURN_TIMEOUT"
+        assert status.json()["events"][-1]["type"] == "turn.failed"
+    finally:
+        adapter.settings.maxun_turn_runtime_seconds = previous_timeout
+
+
+@pytest.mark.asyncio
 async def test_internal_maxun_conversation_delete_is_idempotent(app_and_db):
     headers = {"Authorization": f"Bearer {TOKEN}"}
     created = await _request(
@@ -392,9 +637,115 @@ async def test_internal_maxun_conversation_delete_is_idempotent(app_and_db):
     assert repeated.status_code == 204
     factory = adapter._get_session_factory()
     async with factory() as session:
+        from analytics_agent.db.models import MaxunTurn, MaxunTurnEvent, Message
         from analytics_agent.db.repository import ConversationRepo
+        from sqlalchemy import select
 
         assert await ConversationRepo(session).get(conversation_id) is None
+        assert (
+            await session.execute(
+                select(MaxunTurn).where(MaxunTurn.conversation_id == conversation_id)
+            )
+        ).scalars().all() == []
+        assert (
+            await session.execute(select(Message).where(Message.conversation_id == conversation_id))
+        ).scalars().all() == []
+        assert (await session.execute(select(MaxunTurnEvent))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_lock_registry_preserves_queued_turn_waiters():
+    key = "lock-waiter-test"
+    lock = adapter._lock_for(key)
+    await lock.acquire()
+    waiter = asyncio.create_task(lock.acquire())
+    await asyncio.sleep(0)
+    adapter._maybe_drop_lock(adapter._turn_locks, key, lock)
+    assert adapter._turn_locks.get(key) is lock
+    lock.release()
+    await waiter
+    lock.release()
+    adapter._maybe_drop_lock(adapter._turn_locks, key, lock)
+    assert key not in adapter._turn_locks
+
+
+def test_phase5_result_history_reconstructs_finalized_exchange():
+    history = adapter.build_history(
+        [
+            SimpleNamespace(
+                role="user",
+                event_type="TEXT",
+                payload=orjson.dumps({"text": "How many rows?"}).decode(),
+                id="user-1",
+            ),
+            SimpleNamespace(
+                role="assistant",
+                event_type="MAXUN_RESULT",
+                payload=orjson.dumps(
+                    {
+                        "status": "completed",
+                        "answer": "There are 120 rows.",
+                        "sql": "SELECT COUNT(*) FROM data",
+                        "columns": ["count"],
+                        "rows": [{"count": 120}],
+                        "truncated": False,
+                    }
+                ).decode(),
+                id="result-1",
+            ),
+        ],
+        "What percentage are active?",
+    )
+    assert [message.type for message in history] == ["human", "ai", "human"]
+    assert history[0].content == "How many rows?"
+    assert history[1].content == "There are 120 rows."
+    assert history[2].content == "What percentage are active?"
+
+
+def test_event_payload_accepts_exact_boundary_and_rejects_one_byte_over():
+    prefix = len(orjson.dumps({"text": ""}))
+    exact = {"text": "x" * (adapter._MAX_EVENT_PAYLOAD_BYTES - prefix)}
+    assert len(orjson.dumps(exact)) == adapter._MAX_EVENT_PAYLOAD_BYTES
+    assert len(adapter._encoded_event_payload(exact).encode()) == adapter._MAX_EVENT_PAYLOAD_BYTES
+    with pytest.raises(adapter.MaxunQueryError) as error:
+        adapter._encoded_event_payload({"text": exact["text"] + "x"})
+    assert error.value.code == "MAXUN_RESULT_LIMIT"
+
+
+def test_public_result_preserves_one_envelope_for_query_and_terminal_result():
+    bounded = adapter._bounded_public_result(
+        {
+            "sql": "SELECT * FROM data",
+            "columns": ["value"],
+            "rows": [{"value": "x" * 500} for _ in range(20)],
+            "truncated": False,
+        },
+        answer_budget="x" * 12_000,
+    )
+    terminal = {
+        "status": "completed",
+        "answer": "x" * 12_000,
+        **bounded,
+        "error": None,
+    }
+    assert len(orjson.dumps(bounded)) <= adapter._MAX_EVENT_PAYLOAD_BYTES
+    assert len(orjson.dumps(terminal)) <= adapter._MAX_EVENT_PAYLOAD_BYTES
+    assert bounded["truncated"] is False
+
+
+def test_public_result_is_byte_bounded_with_deterministic_truncation():
+    bounded = adapter._bounded_public_result(
+        {
+            "sql": "SELECT * FROM data",
+            "columns": ["value"],
+            "rows": [{"value": "x" * 2_000} for _ in range(500)],
+            "truncated": False,
+        },
+        answer_budget="x" * 12_000,
+    )
+    assert bounded["truncated"] is True
+    assert len(bounded["rows"]) < 500
+    assert len(orjson.dumps(bounded)) <= adapter._MAX_EVENT_PAYLOAD_BYTES
 
 
 def test_result_requires_successful_sql():

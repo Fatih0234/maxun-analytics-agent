@@ -165,7 +165,12 @@ class MaxunTurn(Base):
 
 
 class MaxunTurnEvent(Base):
-    """Durable private event ledger for resumable Maxun-owned turns."""
+    """Durable private event ledger for resumable Maxun-owned turns.
+
+    Phase 5 retention Option 1 keeps the complete ledger until the owning
+    conversation is deleted. Per-turn event-count and payload bounds prevent
+    an active turn from growing without limit.
+    """
 
     __tablename__ = "maxun_turn_events"
     __table_args__ = (
@@ -193,6 +198,10 @@ class Message(Base):
     conversation_id: Mapped[str] = mapped_column(
         String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
     )
+    # Phase 5 turns may be retried after a process restart. Correlating the
+    # finalized user/result pair with the durable turn prevents duplicate
+    # prompt history and lets recovery repair a missing user message.
+    maxun_turn_record_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     event_type: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[str] = mapped_column(String, nullable=False)  # 'user' | 'assistant'
     payload: Mapped[str] = mapped_column(Text, nullable=False)  # JSON string
