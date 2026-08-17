@@ -9,6 +9,7 @@ module.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import contextlib
 import datetime as dt
@@ -378,6 +379,8 @@ class MaxunWorkspaceEngine(QueryEngine):
         self._turn_query_tool_attempts = 0
         self._turn_sql_attempts = 0
         self._turn_budget_lock = threading.Lock()
+        self._active_holders: list[dict[str, Any]] = []
+        self._active_holders_lock = threading.Lock()
 
     @classmethod
     def from_engine_name(
@@ -502,9 +505,13 @@ class MaxunWorkspaceEngine(QueryEngine):
             }
 
         holder: dict[str, Any] = {"connection": None}
+        with self._active_holders_lock:
+            self._active_holders.append(holder)
         try:
             future = _QUERY_CAPACITY.submit(self._execute_query, normalized, holder)
         except Exception:
+            with self._active_holders_lock:
+                self._active_holders.remove(holder)
             _QUERY_CAPACITY.release()
             return {
                 "error": "The workspace query could not be completed",
@@ -513,9 +520,15 @@ class MaxunWorkspaceEngine(QueryEngine):
                 "rows": [],
                 "truncated": False,
             }
+
         # Release capacity only after the worker has actually finished. A
         # timed-out DuckDB statement may still be unwinding after interrupt().
-        future.add_done_callback(lambda _completed: _QUERY_CAPACITY.release())
+        def finish_query(_completed) -> None:
+            with self._active_holders_lock, contextlib.suppress(ValueError):
+                self._active_holders.remove(holder)
+            _QUERY_CAPACITY.release()
+
+        future.add_done_callback(finish_query)
         try:
             return future.result(timeout=MAX_QUERY_SECONDS)
         except concurrent.futures.TimeoutError:
@@ -578,12 +591,22 @@ class MaxunWorkspaceEngine(QueryEngine):
         if not _QUERY_CAPACITY.acquire(timeout=MAX_QUERY_SECONDS):
             return {"error": "The workspace is busy", "code": "MAXUN_QUERY_BUSY"}
         holder: dict[str, Any] = {"connection": None}
+        with self._active_holders_lock:
+            self._active_holders.append(holder)
         try:
             future = _QUERY_CAPACITY.submit(self._execute_schema, holder)
         except Exception:
+            with self._active_holders_lock:
+                self._active_holders.remove(holder)
             _QUERY_CAPACITY.release()
             return {"error": "The workspace schema is unavailable", "code": "MAXUN_SCHEMA_FAILED"}
-        future.add_done_callback(lambda _completed: _QUERY_CAPACITY.release())
+
+        def finish_schema(_completed) -> None:
+            with self._active_holders_lock, contextlib.suppress(ValueError):
+                self._active_holders.remove(holder)
+            _QUERY_CAPACITY.release()
+
+        future.add_done_callback(finish_schema)
         try:
             return future.result(timeout=MAX_QUERY_SECONDS)
         except concurrent.futures.TimeoutError:
@@ -642,10 +665,23 @@ class MaxunWorkspaceEngine(QueryEngine):
 
         return [execute_sql, list_tables, get_schema, preview_table]
 
+    async def cancel_active(self) -> None:
+        """Interrupt active DuckDB work without closing the workspace engine."""
+
+        with self._active_holders_lock:
+            holders = list(self._active_holders)
+        for holder in holders:
+            connection = holder.get("connection")
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    connection.interrupt()
+        await asyncio.sleep(0)
+
     async def aclose(self) -> None:
         # Query capacity is process-scoped and intentionally outlives each
         # request-scoped engine. The application owns process shutdown.
         self._closed = True
+        await self.cancel_active()
 
 
 __all__ = [

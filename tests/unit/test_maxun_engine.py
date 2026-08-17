@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -222,6 +223,37 @@ def test_timeout_returns_sanitized_error(workspace: Path, monkeypatch):
         result = engine._run_query("SELECT COUNT(*) FROM data")
         assert result["code"] == "MAXUN_QUERY_TIMEOUT"
         assert "/" not in result["error"]
+    finally:
+        asyncio.run(engine.aclose())
+
+
+def test_cancel_active_interrupts_running_duckdb_connection(workspace: Path):
+    engine = MaxunWorkspaceEngine(IDS["workspace"], root=workspace)
+
+    class FakeConnection:
+        interrupted = False
+
+        def interrupt(self):
+            self.interrupted = True
+
+    fake = FakeConnection()
+    started = threading.Event()
+
+    def delayed(sql, holder):
+        holder["connection"] = fake
+        started.set()
+        time.sleep(0.05)
+        holder["connection"] = None
+        return {"columns": ["n"], "rows": [{"n": 2}], "truncated": False}
+
+    engine._execute_query = delayed
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(engine._run_query, "SELECT COUNT(*) FROM data")
+            assert started.wait(timeout=1)
+            asyncio.run(engine.cancel_active())
+            assert fake.interrupted is True
+            assert future.result(timeout=1)["rows"] == [{"n": 2}]
     finally:
         asyncio.run(engine.aclose())
 

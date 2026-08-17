@@ -145,10 +145,45 @@ class MaxunTurn(Base):
     request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="processing")
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_event_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+    events: Mapped[list[MaxunTurnEvent]] = relationship(
+        "MaxunTurnEvent",
+        cascade="all, delete-orphan",
+        order_by="MaxunTurnEvent.sequence",
+    )
+
+
+class MaxunTurnEvent(Base):
+    """Durable private event ledger for resumable Maxun-owned turns."""
+
+    __tablename__ = "maxun_turn_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "turn_record_id",
+            "sequence",
+            name="uq_maxun_turn_event_sequence",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    turn_record_id: Mapped[str] = mapped_column(
+        String, ForeignKey("maxun_turns.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Message(Base):
