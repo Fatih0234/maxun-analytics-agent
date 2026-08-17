@@ -20,9 +20,12 @@ def run_migrations() -> None:
     from alembic import command
     from alembic.config import Config
 
+    sqlite_db_path: Path | None = None
     if "sqlite" in settings.database_url:
         db_path = settings.database_url.replace("sqlite+aiosqlite:///", "")
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        sqlite_db_path = Path(db_path)
+        sqlite_db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        sqlite_db_path.parent.chmod(0o700)
     elif "mysql" in settings.database_url:
         _ensure_mysql_schema()
 
@@ -39,6 +42,8 @@ def run_migrations() -> None:
             str(Path(__file__).parent / "db" / "alembic"),
         )
     command.upgrade(alembic_cfg, "head")
+    if sqlite_db_path and sqlite_db_path.exists():
+        sqlite_db_path.chmod(0o600)
 
 
 def _ensure_mysql_schema() -> None:

@@ -15,6 +15,15 @@ from analytics_agent.db.repository import ConversationRepo, MessageRepo
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
+def _is_internal_maxun_engine(engine_name: str) -> bool:
+    return isinstance(engine_name, str) and engine_name.startswith("maxun:")
+
+
+def _reject_internal_conversation(conversation: Conversation | None) -> None:
+    if conversation and _is_internal_maxun_engine(conversation.engine_name):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+
 class ConversationCreate(BaseModel):
     title: str = "New Conversation"
     engine_name: str
@@ -55,6 +64,8 @@ async def list_conversations(session: AsyncSession = Depends(get_session)):
     conversations = await repo.list()
     result = []
     for conv in conversations:
+        if _is_internal_maxun_engine(conv.engine_name):
+            continue
         msgs = await msg_repo.list_for_conversation(conv.id)
         result.append(
             ConversationSummary(
@@ -74,6 +85,8 @@ async def create_conversation(
     body: ConversationCreate, session: AsyncSession = Depends(get_session)
 ):
     repo = ConversationRepo(session)
+    if _is_internal_maxun_engine(body.engine_name):
+        raise HTTPException(status_code=400, detail="This engine is internal")
     now = datetime.now(UTC)
     conv = Conversation(
         id=str(uuid.uuid4()),
@@ -99,6 +112,7 @@ async def get_conversation(conversation_id: str, session: AsyncSession = Depends
     conv = await repo.get(conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _reject_internal_conversation(conv)
     messages = [
         MessageOut(
             id=msg.id,
@@ -132,6 +146,7 @@ async def generate_title(conversation_id: str, session: AsyncSession = Depends(g
     conv = await repo.get(conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _reject_internal_conversation(conv)
 
     # Collect text content: user questions + assistant COMPLETE responses
     msg_repo = MessageRepo(session)
@@ -210,7 +225,10 @@ async def update_engine(
     conv = await repo.get(conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _reject_internal_conversation(conv)
     engine_name = body.get("engine_name", "").strip()
+    if _is_internal_maxun_engine(engine_name):
+        raise HTTPException(status_code=400, detail="This engine is internal")
     if not engine_name:
         raise HTTPException(status_code=422, detail="engine_name is required")
     conv.engine_name = engine_name
@@ -225,6 +243,7 @@ async def get_context_quality(conversation_id: str, session: AsyncSession = Depe
     conv = await repo.get(conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _reject_internal_conversation(conv)
 
     if conv.quality_score is None:
         return {"score": 3, "label": "Neutral", "breakdown": {"reason": "No assessment yet"}}
@@ -239,6 +258,8 @@ async def get_context_quality(conversation_id: str, session: AsyncSession = Depe
 @router.delete("/{conversation_id}", status_code=204)
 async def delete_conversation(conversation_id: str, session: AsyncSession = Depends(get_session)):
     repo = ConversationRepo(session)
+    conv = await repo.get(conversation_id)
+    _reject_internal_conversation(conv)
     deleted = await repo.delete(conversation_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Conversation not found")

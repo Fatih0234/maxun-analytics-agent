@@ -10,6 +10,7 @@ from analytics_agent.api import (
     chat,
     connectors,
     conversations,
+    maxun_conversations,
     maxun_materialization,
     oauth,
     settings,
@@ -22,6 +23,7 @@ api_router.include_router(settings.router)
 api_router.include_router(oauth.router)
 api_router.include_router(connectors.router)
 api_router.include_router(maxun_materialization.router)
+api_router.include_router(maxun_conversations.router)
 
 # Simple in-memory cache for GitHub release data (avoids hammering the API)
 _releases_cache: dict[str, Any] = {}

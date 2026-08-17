@@ -11,6 +11,7 @@ from analytics_agent.db.models import (
     Conversation,
     Integration,
     IntegrationCredential,
+    MaxunTurn,
     Message,
     Setting,
 )
@@ -30,7 +31,10 @@ class ConversationRepo:
         result = await self._session.execute(
             select(Conversation)
             .where(Conversation.id == conversation_id)
-            .options(selectinload(Conversation.messages))
+            .options(
+                selectinload(Conversation.messages),
+                selectinload(Conversation.maxun_turns),
+            )
         )
         return result.scalar_one_or_none()
 
@@ -47,7 +51,15 @@ class ConversationRepo:
             await self._session.commit()
 
     async def delete(self, conversation_id: str) -> bool:
-        conv = await self._session.get(Conversation, conversation_id)
+        result = await self._session.execute(
+            select(Conversation)
+            .where(Conversation.id == conversation_id)
+            .options(
+                selectinload(Conversation.messages),
+                selectinload(Conversation.maxun_turns),
+            )
+        )
+        conv = result.scalar_one_or_none()
         if not conv:
             return False
         await self._session.delete(conv)
@@ -71,6 +83,20 @@ class ConversationRepo:
 
             conv.updated_at = datetime.now(UTC)
             await self._session.commit()
+
+
+class MaxunTurnRepo:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, conversation_id: str, maxun_turn_id: str) -> MaxunTurn | None:
+        result = await self._session.execute(
+            select(MaxunTurn).where(
+                MaxunTurn.conversation_id == conversation_id,
+                MaxunTurn.maxun_turn_id == maxun_turn_id,
+            )
+        )
+        return result.scalar_one_or_none()
 
 
 class MessageRepo:

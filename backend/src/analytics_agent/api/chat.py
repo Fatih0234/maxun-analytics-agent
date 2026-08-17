@@ -442,7 +442,7 @@ async def send_message(
     from analytics_agent.config import settings
 
     conv = await ConversationRepo(session).get(conversation_id)
-    if not conv:
+    if not conv or conv.engine_name.startswith("maxun:"):
         raise HTTPException(status_code=404, detail="Conversation not found")
     if not body.text.strip():
         raise HTTPException(status_code=422, detail="Message text cannot be empty")
