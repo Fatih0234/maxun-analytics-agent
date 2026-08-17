@@ -15,6 +15,7 @@ import hmac
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
@@ -523,6 +524,7 @@ async def _run_turn(
         if maxun_turn.status != "processing" or await _turn_is_cancel_requested(maxun_turn.id):
             return _stored_turn_result(maxun_turn) or _cancelled_result()
 
+        turn_record_id = maxun_turn.id
         message_repo = MessageRepo(session)
         prior_messages = await message_repo.list_for_conversation(conversation_id)
         sequence = len(prior_messages)
@@ -541,6 +543,21 @@ async def _run_turn(
         events: list[dict[str, Any]] = []
         successful_sql_seen = False
         cancellation_requested = False
+        pending_answer_delta = ""
+        last_delta_flush = time.monotonic()
+
+        async def flush_answer_delta() -> None:
+            nonlocal pending_answer_delta, last_delta_flush
+            if not pending_answer_delta:
+                return
+            await _append_turn_event(
+                turn_record_id,
+                "answer.delta",
+                {"text": pending_answer_delta[:_MAX_ANSWER_CHARS]},
+            )
+            pending_answer_delta = ""
+            last_delta_flush = time.monotonic()
+
         try:
             engine = await resolve_engine(
                 expected_engine,
@@ -587,6 +604,8 @@ async def _run_turn(
                             await cancel_active()
                     break
                 event_type = event.get("event")
+                if pending_answer_delta and time.monotonic() - last_delta_flush >= 0.25:
+                    await flush_answer_delta()
                 if event_type in {"KEEPALIVE", "USAGE", "CHART"}:
                     continue
                 if event_type == "ERROR":
@@ -615,11 +634,11 @@ async def _run_turn(
                 elif event_type == "TEXT" and successful_sql_seen:
                     payload = event.get("payload")
                     if isinstance(payload, dict) and isinstance(payload.get("text"), str):
-                        await _append_turn_event(
-                            maxun_turn.id,
-                            "answer.delta",
-                            {"text": payload["text"][:_MAX_ANSWER_CHARS]},
-                        )
+                        pending_answer_delta = (f"{pending_answer_delta}{payload['text']}")[
+                            :_MAX_ANSWER_CHARS
+                        ]
+                        if len(pending_answer_delta.encode()) >= 4096:
+                            await flush_answer_delta()
                 if event_type in {"TEXT", "TOOL_CALL", "TOOL_RESULT", "SQL", "ERROR", "COMPLETE"}:
                     role = "assistant"
                     payload = cast(
@@ -628,6 +647,7 @@ async def _run_turn(
                     )
                     session.add(_new_message(conversation_id, event_type, role, payload, sequence))
                     sequence += 1
+            await flush_answer_delta()
         except Exception as error:
             safe = _safe_error(error)
             logger.info("Maxun internal turn failed: %s", safe["code"])
