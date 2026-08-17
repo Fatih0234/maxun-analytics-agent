@@ -748,6 +748,8 @@ async def test_recovered_turn_history_excludes_partial_attempt_events(app_and_db
             break
         await asyncio.sleep(0.01)
     assert status.json()["status"] == "completed"
+    assert status.json()["attempt"] == 2
+    assert "turn.reset" in [event["type"] for event in status.json()["events"]]
     assert [message.content for message in captured_histories[-1]] == [
         "How many rows?",
         "There are 2 rows.",
