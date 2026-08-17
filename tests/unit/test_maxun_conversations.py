@@ -559,6 +559,82 @@ async def test_turn_history_messages_are_correlated_once(app_and_db):
 
 
 @pytest.mark.asyncio
+async def test_two_turn_history_reconstructs_each_finalized_exchange_once(app_and_db, monkeypatch):
+    original_build_history = adapter.build_history
+    captured_histories = []
+
+    def capture_history(*args, **kwargs):
+        history = original_build_history(*args, **kwargs)
+        captured_histories.append(history)
+        return history
+
+    monkeypatch.setattr(adapter, "build_history", capture_history)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+
+    async def complete_turn(turn_id, question):
+        response = await _request(
+            app_and_db,
+            "POST",
+            f"/internal/maxun/conversations/{conversation_id}/turns",
+            headers=headers,
+            json={
+                "maxun_turn_id": turn_id,
+                "workspace_id": WORKSPACE_ID,
+                "workspace_version": 1,
+                "data_signature": SIGNATURE,
+                "question": question,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "completed"
+
+    await complete_turn("99999999-9999-4999-8999-999999999991", "How many rows?")
+    await complete_turn("99999999-9999-4999-8999-999999999990", "What is the next question?")
+
+    assert [[message.type for message in history] for history in captured_histories] == [
+        ["human"],
+        ["human", "ai", "human"],
+    ]
+    assert [message.content for message in captured_histories[1]] == [
+        "How many rows?",
+        "There are 2 rows.",
+        "What is the next question?",
+    ]
+
+    factory = adapter._get_session_factory()
+    async with factory() as session:
+        from analytics_agent.db.models import Message
+        from sqlalchemy import select
+
+        rows = list(
+            (
+                await session.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.sequence)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [(row.event_type, row.role) for row in rows] == [
+        ("TEXT", "user"),
+        ("MAXUN_RESULT", "assistant"),
+        ("TEXT", "user"),
+        ("MAXUN_RESULT", "assistant"),
+    ]
+    assert len({row.maxun_turn_record_id for row in rows}) == 2
+
+
+@pytest.mark.asyncio
 async def test_sqlite_event_appends_are_serialized_by_turn_lock(app_and_db):
     from analytics_agent.db.models import Conversation, MaxunTurn
     from sqlalchemy import select
