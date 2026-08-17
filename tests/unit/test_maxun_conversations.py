@@ -635,6 +635,147 @@ async def test_two_turn_history_reconstructs_each_finalized_exchange_once(app_an
 
 
 @pytest.mark.asyncio
+async def test_recovered_turn_history_excludes_partial_attempt_events(app_and_db, monkeypatch):
+    original_build_history = adapter.build_history
+    captured_histories = []
+
+    def capture_history(*args, **kwargs):
+        history = original_build_history(*args, **kwargs)
+        captured_histories.append(history)
+        return history
+
+    monkeypatch.setattr(adapter, "build_history", capture_history)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+    first_turn_id = "99999999-9999-4999-8999-999999999989"
+    first_body = {
+        "maxun_turn_id": first_turn_id,
+        "workspace_id": WORKSPACE_ID,
+        "workspace_version": 1,
+        "data_signature": SIGNATURE,
+        "question": "How many rows?",
+    }
+    first = await _request(
+        app_and_db,
+        "POST",
+        f"/internal/maxun/conversations/{conversation_id}/turns",
+        headers=headers,
+        json=first_body,
+    )
+    assert first.status_code == 200
+
+    from analytics_agent.db.models import MaxunTurn, MaxunTurnEvent, Message
+    from sqlalchemy import select
+
+    recovered_turn_id = "99999999-9999-4999-8999-999999999988"
+    recovered_body = {
+        "maxun_turn_id": recovered_turn_id,
+        "workspace_id": WORKSPACE_ID,
+        "workspace_version": 1,
+        "data_signature": SIGNATURE,
+        "question": "Recover this question",
+    }
+    request = adapter.MaxunTurnRequest(**recovered_body)
+    turn_record_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbb988"
+    async with adapter._get_session_factory()() as session:
+        session.add(
+            MaxunTurn(
+                id=turn_record_id,
+                conversation_id=conversation_id,
+                maxun_turn_id=recovered_turn_id,
+                request_digest=adapter._request_digest(request),
+                status="processing",
+                attempt=1,
+                next_event_sequence=3,
+            )
+        )
+        session.add(
+            Message(
+                id="cccccccc-cccc-4ccc-8ccc-cccccccccc88",
+                conversation_id=conversation_id,
+                maxun_turn_record_id=turn_record_id,
+                event_type="TEXT",
+                role="user",
+                payload=orjson.dumps({"text": recovered_body["question"]}).decode(),
+                sequence=2,
+            )
+        )
+        session.add(
+            MaxunTurnEvent(
+                id="dddddddd-dddd-4ddd-8ddd-dddddddddd88",
+                turn_record_id=turn_record_id,
+                sequence=1,
+                event_type="turn.started",
+                payload=orjson.dumps({"attempt": 1}).decode(),
+            )
+        )
+        session.add(
+            MaxunTurnEvent(
+                id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeee88",
+                turn_record_id=turn_record_id,
+                sequence=2,
+                event_type="answer.delta",
+                payload=orjson.dumps(
+                    {"text": "partial attempt that must not become history"}
+                ).decode(),
+            )
+        )
+        await session.commit()
+
+    recovered = await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{recovered_turn_id}",
+        headers=headers,
+        json=recovered_body,
+    )
+    assert recovered.status_code == 200
+    for _ in range(20):
+        status = await _request(
+            app_and_db,
+            "GET",
+            f"/internal/maxun/conversations/{conversation_id}/turns/{recovered_turn_id}/events?after=0",
+            headers=headers,
+        )
+        if status.json()["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+    assert status.json()["status"] == "completed"
+    assert [message.content for message in captured_histories[-1]] == [
+        "How many rows?",
+        "There are 2 rows.",
+        "Recover this question",
+    ]
+    assert all("partial attempt" not in message.content for message in captured_histories[-1])
+
+    async with adapter._get_session_factory()() as session:
+        messages = list(
+            (
+                await session.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.sequence)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [(message.event_type, message.role) for message in messages] == [
+        ("TEXT", "user"),
+        ("MAXUN_RESULT", "assistant"),
+        ("TEXT", "user"),
+        ("MAXUN_RESULT", "assistant"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_sqlite_event_appends_are_serialized_by_turn_lock(app_and_db):
     from analytics_agent.db.models import Conversation, MaxunTurn
     from sqlalchemy import select
