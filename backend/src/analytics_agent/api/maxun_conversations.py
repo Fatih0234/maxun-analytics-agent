@@ -19,7 +19,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 
 import orjson
 from fastapi import APIRouter, Header, HTTPException
@@ -542,16 +542,17 @@ async def _run_turn(
         message_repo = MessageRepo(session)
         prior_messages = await message_repo.list_for_conversation(conversation_id)
         sequence = len(prior_messages)
-        session.add(
-            _new_message(
-                conversation_id,
-                "TEXT",
-                "user",
-                {"text": request.question.strip()},
-                sequence,
+        if not recovered:
+            session.add(
+                _new_message(
+                    conversation_id,
+                    "TEXT",
+                    "user",
+                    {"text": request.question.strip()},
+                    sequence,
+                )
             )
-        )
-        sequence += 1
+            sequence += 1
 
         engine = None
         events: list[dict[str, Any]] = []
@@ -653,14 +654,10 @@ async def _run_turn(
                         ]
                         if len(pending_answer_delta.encode()) >= 4096:
                             await flush_answer_delta()
-                if event_type in {"TEXT", "TOOL_CALL", "TOOL_RESULT", "SQL", "ERROR", "COMPLETE"}:
-                    role = "assistant"
-                    payload = cast(
-                        dict[str, Any],
-                        event.get("payload") if isinstance(event.get("payload"), dict) else {},
-                    )
-                    session.add(_new_message(conversation_id, event_type, role, payload, sequence))
-                    sequence += 1
+                # Partial Agent events belong to the durable turn-event ledger,
+                # not conversation history. Only the final MAXUN_RESULT below
+                # becomes prompt history, so a recovered attempt cannot feed
+                # unfinished tool/prose output back into the next prompt.
             await flush_answer_delta()
         except Exception as error:
             safe = _safe_error(error)
@@ -672,15 +669,6 @@ async def _run_turn(
                 "payload": {"error": "The workspace question could not be completed"},
             }
             events.append(failed_event)
-            session.add(
-                _new_message(
-                    conversation_id,
-                    "ERROR",
-                    "assistant",
-                    {"error": "The workspace question could not be completed"},
-                    sequence,
-                )
-            )
         finally:
             _active_engines.pop(maxun_turn.id, None)
             if engine is not None:
