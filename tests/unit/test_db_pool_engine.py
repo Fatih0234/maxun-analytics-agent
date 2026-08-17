@@ -53,7 +53,7 @@ def _call_get_engine(database_url: str, command_timeout: int = 30):
 def test_sqlite_engine_omits_pool_kwargs():
     args, kwargs = _call_get_engine("sqlite+aiosqlite:///./data/dev.db")
     assert _POOL_KWARGS.isdisjoint(kwargs)
-    assert kwargs["connect_args"] == {"check_same_thread": False}
+    assert kwargs["connect_args"] == {"check_same_thread": False, "timeout": 30}
 
 
 def test_postgres_engine_applies_pool_kwargs_and_command_timeout():

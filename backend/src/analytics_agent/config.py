@@ -266,6 +266,10 @@ class Settings(BaseSettings):
     # App
     log_level: str = "INFO"
     sse_keepalive_interval: int = 15
+    # Total wall-clock envelope for one Maxun turn, including provider wait.
+    # Maxun remains the public authority; this Agent limit releases local
+    # semaphore/engine capacity if the provider never returns.
+    maxun_turn_runtime_seconds: int = 300
     agent_recursion_limit: int = 50
     # Token budget for reconstructed chat history sent to the LLM.
     # Leaves ~80K headroom for system prompt, tool definitions, and response

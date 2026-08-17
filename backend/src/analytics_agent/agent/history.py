@@ -20,6 +20,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from analytics_agent.agent.compaction import HistoryCompactor
 
+_MAX_HISTORY_ANSWER_CHARS = 12_000
+
 
 def build_history(
     stored_messages: list,
@@ -60,6 +62,7 @@ def build_history(
         text_chunks: list[str] = []
         final_text = ""
         has_chart = False
+        has_completed_result = False
 
         for role, payload, msg in turn[1:]:
             if role != "assistant":
@@ -90,6 +93,16 @@ def build_history(
                     text_chunks.append(chunk)
             elif evt == "COMPLETE":
                 final_text = payload.get("text", "")
+            elif evt == "MAXUN_RESULT":
+                # Phase 5 intentionally persists only the finalized result,
+                # not partial provider/tool events. Reconstruct a bounded
+                # assistant message from that canonical record so multi-turn
+                # Maxun conversations retain their prior exchange.
+                if payload.get("status") == "completed":
+                    answer = payload.get("answer", "")
+                    if isinstance(answer, str):
+                        final_text = answer[:_MAX_HISTORY_ANSWER_CHARS]
+                    has_completed_result = True
             elif evt == "CHART":
                 has_chart = True
 
@@ -103,7 +116,7 @@ def build_history(
         if not final_text and has_chart:
             final_text = "[Chart rendered]"
 
-        has_any_assistant_content = tool_calls or final_text or has_chart
+        has_any_assistant_content = tool_calls or final_text or has_chart or has_completed_result
         if not has_any_assistant_content:
             continue
 

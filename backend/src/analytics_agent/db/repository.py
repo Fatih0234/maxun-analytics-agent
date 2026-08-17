@@ -18,6 +18,9 @@ from analytics_agent.db.models import (
     Setting,
 )
 
+MAX_TURN_EVENT_COUNT = 512
+_TERMINAL_EVENT_TYPES = {"turn.completed", "turn.failed", "turn.cancelled"}
+
 
 class ConversationRepo:
     def __init__(self, session: AsyncSession) -> None:
@@ -137,6 +140,10 @@ class MaxunTurnRepo:
             if turn is None:
                 raise ValueError("Maxun turn does not exist")
             sequence = turn.next_event_sequence
+            if sequence > MAX_TURN_EVENT_COUNT or (
+                sequence == MAX_TURN_EVENT_COUNT and event_type not in _TERMINAL_EVENT_TYPES
+            ):
+                raise ValueError("Maxun turn event limit reached")
             turn.next_event_sequence = sequence + 1
             turn.updated_at = datetime.now(UTC)
             event = MaxunTurnEvent(
@@ -169,12 +176,19 @@ class MessageRepo:
         await self._session.commit()
         return message
 
-    async def list_for_conversation(self, conversation_id: str) -> list[Message]:
-        result = await self._session.execute(
-            select(Message)
-            .where(Message.conversation_id == conversation_id)
-            .order_by(Message.sequence)
-        )
+    async def list_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        exclude_turn_record_id: str | None = None,
+    ) -> list[Message]:
+        query = select(Message).where(Message.conversation_id == conversation_id)
+        if exclude_turn_record_id is not None:
+            query = query.where(
+                (Message.maxun_turn_record_id.is_(None))
+                | (Message.maxun_turn_record_id != exclude_turn_record_id)
+            )
+        result = await self._session.execute(query.order_by(Message.sequence))
         return list(result.scalars().all())
 
 
