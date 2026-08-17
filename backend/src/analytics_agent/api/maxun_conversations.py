@@ -874,26 +874,35 @@ async def ensure_turn(
     if not _UUID_RE.fullmatch(conversation_id):
         raise HTTPException(status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"})
 
-    existing_task = _turn_tasks.get(maxun_turn_id)
-    # The task key is the durable MaxunTurn record ID, not the public UUID.
-    # Lookup the record first so a process restart can recover it safely.
-    factory = _get_session_factory()
-    async with factory() as session:
-        conversation = await ConversationRepo(session).get(conversation_id)
-        if not conversation:
-            raise HTTPException(status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"})
-        record = await MaxunTurnRepo(session).get(conversation_id, maxun_turn_id)
-    if record is not None:
-        existing_task = _turn_tasks.get(record.id)
-    record, replay, recovered = await _ensure_turn_record(
-        conversation_id,
-        body,
-        recover_processing=None if existing_task is not None and not existing_task.done() else True,
-    )
-    if replay is not None:
-        return _turn_status_payload(record, replay)
-    _schedule_turn(conversation_id, body, record, recovered)
-    return _turn_status_payload(record)
+    lock = _lock_for(conversation_id)
+    try:
+        async with lock:
+            existing_task = _turn_tasks.get(maxun_turn_id)
+            # The task key is the durable MaxunTurn record ID, not the public UUID.
+            # Lookup the record first so a process restart can recover it safely.
+            factory = _get_session_factory()
+            async with factory() as session:
+                conversation = await ConversationRepo(session).get(conversation_id)
+                if not conversation:
+                    raise HTTPException(
+                        status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"}
+                    )
+                record = await MaxunTurnRepo(session).get(conversation_id, maxun_turn_id)
+            if record is not None:
+                existing_task = _turn_tasks.get(record.id)
+            record, replay, recovered = await _ensure_turn_record(
+                conversation_id,
+                body,
+                recover_processing=None
+                if existing_task is not None and not existing_task.done()
+                else True,
+            )
+            if replay is not None:
+                return _turn_status_payload(record, replay)
+            _schedule_turn(conversation_id, body, record, recovered)
+            return _turn_status_payload(record)
+    finally:
+        _turn_locks.pop(conversation_id, None)
 
 
 @router.get("/{conversation_id}/turns/{maxun_turn_id}/events")
