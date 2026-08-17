@@ -8,7 +8,9 @@ from tests.unit.test_maxun_engine import IDS
 
 
 def test_maxun_graph_profile_has_no_chart_or_context_node(monkeypatch):
-    monkeypatch.setattr(graph_module, "get_llm", lambda streaming=True: FakeListChatModel(responses=["done"]))
+    monkeypatch.setattr(
+        graph_module, "get_llm", lambda streaming=True: FakeListChatModel(responses=["done"])
+    )
     engine = object.__new__(MaxunWorkspaceEngine)
     # The graph only needs the fixed tool surface when checking profile wiring.
     engine_tools = []

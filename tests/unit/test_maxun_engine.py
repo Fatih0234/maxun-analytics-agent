@@ -84,8 +84,12 @@ def test_workspace_queries_are_read_only_and_bounded(workspace: Path):
             "rows": [{"n": 2}],
             "truncated": False,
         }
-        assert engine._run_query('SELECT SUM("Price") AS total FROM data') ["rows"] == [{"total": 4.0}]
-        assert engine._run_query("WITH x AS (SELECT * FROM data) SELECT COUNT(*) AS n FROM x")["rows"] == [{"n": 2}]
+        assert engine._run_query('SELECT SUM("Price") AS total FROM data')["rows"] == [
+            {"total": 4.0}
+        ]
+        assert engine._run_query("WITH x AS (SELECT * FROM data) SELECT COUNT(*) AS n FROM x")[
+            "rows"
+        ] == [{"n": 2}]
     finally:
         asyncio.run(engine.aclose())
 
@@ -163,6 +167,7 @@ def test_global_query_capacity_applies_across_engine_instances(workspace: Path, 
     engines = [MaxunWorkspaceEngine(IDS["workspace"], root=workspace) for _ in range(3)]
     active = 0
     maximum = 0
+
     def delayed(sql, holder):
         nonlocal active, maximum
         active += 1
@@ -175,7 +180,9 @@ def test_global_query_capacity_applies_across_engine_instances(workspace: Path, 
         item._execute_query = delayed
     try:
         with ThreadPoolExecutor(max_workers=3) as executor:
-            results = list(executor.map(lambda item: item._run_query("SELECT COUNT(*) FROM data"), engines))
+            results = list(
+                executor.map(lambda item: item._run_query("SELECT COUNT(*) FROM data"), engines)
+            )
         assert all(result["rows"] == [{"n": 2}] for result in results)
         assert maximum <= 2
     finally:
@@ -224,9 +231,11 @@ def test_per_turn_tool_budget_limits_sql_execution(workspace: Path):
     engine.configure_turn_budget(max_query_tools=3, max_sql_executions=1)
     try:
         execute = next(tool for tool in engine.get_tools() if tool.name == "execute_sql")
-        assert '"rows":[{"count":2}]' in execute.invoke({"sql": "SELECT COUNT(*) AS count FROM data"})
+        assert '"rows":[{"count":2}]' in execute.invoke(
+            {"sql": "SELECT COUNT(*) AS count FROM data"}
+        )
         blocked = execute.invoke({"sql": "SELECT COUNT(*) AS count FROM data"})
-        assert 'MAXUN_QUERY_LIMIT' in blocked
+        assert "MAXUN_QUERY_LIMIT" in blocked
     finally:
         asyncio.run(engine.aclose())
 

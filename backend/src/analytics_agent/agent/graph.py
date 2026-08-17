@@ -64,7 +64,8 @@ def build_graph(
         if engine_tools is None:
             engine_tools = engine.get_tools()
         engine_tools = [
-            tool for tool in engine_tools
+            tool
+            for tool in engine_tools
             if tool.name in {"execute_sql", "list_tables", "get_schema", "preview_table"}
         ]
         all_tools = engine_tools

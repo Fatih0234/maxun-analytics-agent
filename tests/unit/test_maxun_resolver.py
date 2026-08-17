@@ -38,7 +38,9 @@ async def test_maxun_resolution_requires_snapshot_metadata():
 
 @pytest.mark.asyncio
 async def test_invalid_maxun_namespace_never_falls_back(monkeypatch):
-    monkeypatch.setattr("analytics_agent.engines.factory.get_registry", lambda: {"default": object()})
+    monkeypatch.setattr(
+        "analytics_agent.engines.factory.get_registry", lambda: {"default": object()}
+    )
     with pytest.raises(MaxunQueryError) as error:
         await resolver.resolve_engine(
             "maxun:not-a-uuid",

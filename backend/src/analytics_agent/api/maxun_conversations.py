@@ -39,9 +39,7 @@ from analytics_agent.maxun.materialization import configured_token
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/internal/maxun/conversations", tags=["maxun-conversations"])
 
-_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_ANSWER_CHARS = 12_000
 _MAX_QUESTION_CHARS = 4_000
@@ -160,7 +158,11 @@ async def _mock_maxun_events(
     """
 
     lowered = question.casefold()
-    sql = 'SELECT SUM("Price") AS total FROM data' if "sum" in lowered or "total" in lowered else "SELECT COUNT(*) AS count FROM data"
+    sql = (
+        'SELECT SUM("Price") AS total FROM data'
+        if "sum" in lowered or "total" in lowered
+        else "SELECT COUNT(*) AS count FROM data"
+    )
     execute = next((item for item in engine.get_tools() if item.name == "execute_sql"), None)
     if execute is None:
         raise MaxunQueryError("MAXUN_QUERY_FAILED", "The workspace query could not be completed")
@@ -174,7 +176,11 @@ async def _mock_maxun_events(
         }
         return
     rows = result.get("rows", [])
-    value = rows[0].get("total" if "sum" in lowered or "total" in lowered else "count") if rows else None
+    value = (
+        rows[0].get("total" if "sum" in lowered or "total" in lowered else "count")
+        if rows
+        else None
+    )
     answer = f"The result is {value}."
     yield {
         "event": "SQL",
@@ -249,7 +255,10 @@ def _result_from_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "truncated": sql_result.get("truncated", False) if sql_result else False,
     }
     if failed:
-        result["error"] = {"code": failure_code, "message": "The workspace question could not be completed"}
+        result["error"] = {
+            "code": failure_code,
+            "message": "The workspace question could not be completed",
+        }
     return result
 
 
@@ -265,7 +274,9 @@ async def _run_turn(
             raise HTTPException(status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"})
         expected_engine = f"maxun:{request.workspace_id}"
         if conversation.engine_name != expected_engine:
-            raise HTTPException(status_code=409, detail={"code": "MAXUN_CONVERSATION_BINDING_MISMATCH"})
+            raise HTTPException(
+                status_code=409, detail={"code": "MAXUN_CONVERSATION_BINDING_MISMATCH"}
+            )
 
         maxun_turn_repo = MaxunTurnRepo(session)
         request_digest = _request_digest(request)
@@ -315,13 +326,15 @@ async def _run_turn(
         message_repo = MessageRepo(session)
         prior_messages = await message_repo.list_for_conversation(conversation_id)
         sequence = len(prior_messages)
-        session.add(_new_message(
-            conversation_id,
-            "TEXT",
-            "user",
-            {"text": request.question.strip()},
-            sequence,
-        ))
+        session.add(
+            _new_message(
+                conversation_id,
+                "TEXT",
+                "user",
+                {"text": request.question.strip()},
+                sequence,
+            )
+        )
         sequence += 1
 
         engine = None
@@ -390,13 +403,15 @@ async def _run_turn(
                 "payload": {"error": "The workspace question could not be completed"},
             }
             events.append(failed_event)
-            session.add(_new_message(
-                conversation_id,
-                "ERROR",
-                "assistant",
-                {"error": "The workspace question could not be completed"},
-                sequence,
-            ))
+            session.add(
+                _new_message(
+                    conversation_id,
+                    "ERROR",
+                    "assistant",
+                    {"error": "The workspace question could not be completed"},
+                    sequence,
+                )
+            )
         finally:
             if engine is not None:
                 with contextlib.suppress(Exception):
@@ -468,7 +483,9 @@ async def create_conversation(
             raise
         except Exception as error:
             logger.info("Maxun internal conversation creation failed: %s", type(error).__name__)
-            raise HTTPException(status_code=503, detail={"code": "MAXUN_WORKSPACE_UNAVAILABLE"}) from error
+            raise HTTPException(
+                status_code=503, detail={"code": "MAXUN_WORKSPACE_UNAVAILABLE"}
+            ) from error
         finally:
             if engine is not None:
                 with contextlib.suppress(Exception):
@@ -494,7 +511,9 @@ async def delete_conversation(
                 if not conversation:
                     return
                 if not conversation.engine_name.startswith("maxun:"):
-                    raise HTTPException(status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"})
+                    raise HTTPException(
+                        status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"}
+                    )
                 await repo.delete(conversation_id)
     finally:
         _turn_locks.pop(conversation_id, None)

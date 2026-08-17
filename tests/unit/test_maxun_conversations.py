@@ -49,11 +49,19 @@ def app_and_db(tmp_path: Path, monkeypatch):
     async def fake_events(**kwargs) -> AsyncIterator[dict]:
         yield {
             "event": "TOOL_CALL",
-            "payload": {"tool_name": "execute_sql", "tool_input": {"sql": "SELECT COUNT(*) FROM data"}},
+            "payload": {
+                "tool_name": "execute_sql",
+                "tool_input": {"sql": "SELECT COUNT(*) FROM data"},
+            },
         }
         yield {
             "event": "SQL",
-            "payload": {"sql": "SELECT COUNT(*) FROM data", "columns": ["count"], "rows": [{"count": 2}], "truncated": False},
+            "payload": {
+                "sql": "SELECT COUNT(*) FROM data",
+                "columns": ["count"],
+                "rows": [{"count": 2}],
+                "truncated": False,
+            },
         }
         yield {"event": "TEXT", "payload": {"text": "There are 2 rows."}}
         yield {"event": "COMPLETE", "payload": {"text": "There are 2 rows."}}
@@ -222,41 +230,87 @@ async def test_internal_maxun_conversation_delete_is_idempotent(app_and_db):
 
 
 def test_result_requires_successful_sql():
-    assert adapter._result_from_events([
-        {"event": "TEXT", "payload": {"text": "42"}},
-        {"event": "COMPLETE", "payload": {"text": "42"}},
-    ]) == {
+    assert adapter._result_from_events(
+        [
+            {"event": "TEXT", "payload": {"text": "42"}},
+            {"event": "COMPLETE", "payload": {"text": "42"}},
+        ]
+    ) == {
         "status": "error",
         "answer": "42",
         "sql": None,
         "columns": [],
         "rows": [],
         "truncated": False,
-        "error": {"code": "MAXUN_QUERY_REQUIRED", "message": "The workspace question could not be completed"},
+        "error": {
+            "code": "MAXUN_QUERY_REQUIRED",
+            "message": "The workspace question could not be completed",
+        },
     }
 
 
 def test_result_deduplicates_repeated_sql_events_but_rejects_distinct_queries():
-    duplicate = adapter._result_from_events([
-        {"event": "SQL", "payload": {"sql": "SELECT COUNT(*) FROM data", "columns": ["count"], "rows": [{"count": 2}]}},
-        {"event": "SQL", "payload": {"sql": "SELECT COUNT(*) FROM data", "columns": ["count"], "rows": [{"count": 2}]}},
-    ])
+    duplicate = adapter._result_from_events(
+        [
+            {
+                "event": "SQL",
+                "payload": {
+                    "sql": "SELECT COUNT(*) FROM data",
+                    "columns": ["count"],
+                    "rows": [{"count": 2}],
+                },
+            },
+            {
+                "event": "SQL",
+                "payload": {
+                    "sql": "SELECT COUNT(*) FROM data",
+                    "columns": ["count"],
+                    "rows": [{"count": 2}],
+                },
+            },
+        ]
+    )
     assert duplicate["status"] == "completed"
-    distinct = adapter._result_from_events([
-        {"event": "SQL", "payload": {"sql": "SELECT COUNT(*) FROM data", "columns": ["count"], "rows": [{"count": 2}]}},
-        {"event": "SQL", "payload": {"sql": "SELECT SUM(value) FROM data", "columns": ["sum"], "rows": [{"sum": 3}]}},
-    ])
+    distinct = adapter._result_from_events(
+        [
+            {
+                "event": "SQL",
+                "payload": {
+                    "sql": "SELECT COUNT(*) FROM data",
+                    "columns": ["count"],
+                    "rows": [{"count": 2}],
+                },
+            },
+            {
+                "event": "SQL",
+                "payload": {
+                    "sql": "SELECT SUM(value) FROM data",
+                    "columns": ["sum"],
+                    "rows": [{"sum": 3}],
+                },
+            },
+        ]
+    )
     assert distinct["status"] == "error"
     assert distinct["error"]["code"] == "MAXUN_QUERY_LIMIT"
 
 
 def test_result_allows_recovery_after_failed_sql():
-    result = adapter._result_from_events([
-        {"event": "TOOL_RESULT", "payload": {"tool_name": "execute_sql", "is_error": True}},
-        {"event": "SQL", "payload": {"sql": "SELECT COUNT(*) FROM data", "columns": ["count"], "rows": [{"count": 2}]}},
-        {"event": "TEXT", "payload": {"text": "There are 2 rows."}},
-        {"event": "COMPLETE", "payload": {"text": "There are 2 rows."}},
-    ])
+    result = adapter._result_from_events(
+        [
+            {"event": "TOOL_RESULT", "payload": {"tool_name": "execute_sql", "is_error": True}},
+            {
+                "event": "SQL",
+                "payload": {
+                    "sql": "SELECT COUNT(*) FROM data",
+                    "columns": ["count"],
+                    "rows": [{"count": 2}],
+                },
+            },
+            {"event": "TEXT", "payload": {"text": "There are 2 rows."}},
+            {"event": "COMPLETE", "payload": {"text": "There are 2 rows."}},
+        ]
+    )
     assert result["status"] == "completed"
     assert result["sql"] == "SELECT COUNT(*) FROM data"
 
@@ -313,6 +367,12 @@ async def test_internal_route_rejects_malformed_snapshot_and_unknown_conversatio
         "POST",
         "/internal/maxun/conversations/not-a-uuid/turns",
         headers=headers,
-        json={"maxun_turn_id": TURN_ID, "workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE, "question": "x"},
+        json={
+            "maxun_turn_id": TURN_ID,
+            "workspace_id": WORKSPACE_ID,
+            "workspace_version": 1,
+            "data_signature": SIGNATURE,
+            "question": "x",
+        },
     )
     assert response.status_code == 404

@@ -138,10 +138,15 @@ def _workspace_artifact_path(workspace_id: str, root: str | Path | None = None) 
     if artifact.is_symlink() or not artifact.is_file():
         raise MaxunQueryError("MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable")
     try:
-        if stat.S_IMODE(directory.stat().st_mode) & 0o077 or stat.S_IMODE(artifact.stat().st_mode) & 0o077:
+        if (
+            stat.S_IMODE(directory.stat().st_mode) & 0o077
+            or stat.S_IMODE(artifact.stat().st_mode) & 0o077
+        ):
             raise MaxunQueryError("MAXUN_WORKSPACE_INTEGRITY", "Workspace data is unavailable")
     except OSError as error:
-        raise MaxunQueryError("MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable") from error
+        raise MaxunQueryError(
+            "MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable"
+        ) from error
     return artifact
 
 
@@ -190,7 +195,9 @@ def _validate_artifact(
         raise
     except Exception as error:
         logger.info("Maxun workspace artifact validation failed: %s", type(error).__name__)
-        raise MaxunQueryError("MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable") from error
+        raise MaxunQueryError(
+            "MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable"
+        ) from error
 
     if not found:
         raise MaxunQueryError("MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable")
@@ -429,13 +436,17 @@ class MaxunWorkspaceEngine(QueryEngine):
             raise
         except Exception as error:
             logger.info("Maxun workspace query failed: %s", type(error).__name__)
-            raise MaxunQueryError("MAXUN_QUERY_FAILED", "The workspace query could not be completed") from error
+            raise MaxunQueryError(
+                "MAXUN_QUERY_FAILED", "The workspace query could not be completed"
+            ) from error
         finally:
             if connection is not None:
                 connection.close()
             holder["connection"] = None
 
-    def configure_turn_budget(self, *, max_query_tools: int = 3, max_sql_executions: int = 1) -> None:
+    def configure_turn_budget(
+        self, *, max_query_tools: int = 3, max_sql_executions: int = 1
+    ) -> None:
         if max_query_tools < 1 or max_sql_executions < 1:
             raise ValueError("Maxun turn query budgets must be positive")
         with self._turn_budget_lock:
@@ -459,7 +470,10 @@ class MaxunWorkspaceEngine(QueryEngine):
 
     def _run_query(self, sql: str, *, sql_execution: bool = False) -> dict[str, Any]:
         if self._closed:
-            return {"error": "The workspace query could not be completed", "code": "MAXUN_ENGINE_CLOSED"}
+            return {
+                "error": "The workspace query could not be completed",
+                "code": "MAXUN_ENGINE_CLOSED",
+            }
         if not self._consume_turn_query_budget(sql_execution=sql_execution):
             return {
                 "error": "The workspace query-tool budget is exhausted",
@@ -471,7 +485,13 @@ class MaxunWorkspaceEngine(QueryEngine):
         try:
             normalized = validate_sql(sql)
         except MaxunQueryError as error:
-            return {"error": error.message, "code": error.code, "columns": [], "rows": [], "truncated": False}
+            return {
+                "error": error.message,
+                "code": error.code,
+                "columns": [],
+                "rows": [],
+                "truncated": False,
+            }
         if not _QUERY_CAPACITY.acquire(timeout=MAX_QUERY_SECONDS):
             return {
                 "error": "The workspace is busy",
@@ -515,7 +535,13 @@ class MaxunWorkspaceEngine(QueryEngine):
                 "truncated": False,
             }
         except MaxunQueryError as error:
-            return {"error": error.message, "code": error.code, "columns": [], "rows": [], "truncated": False}
+            return {
+                "error": error.message,
+                "code": error.code,
+                "columns": [],
+                "rows": [],
+                "truncated": False,
+            }
         except Exception:
             return {
                 "error": "The workspace query could not be completed",
@@ -545,7 +571,10 @@ class MaxunWorkspaceEngine(QueryEngine):
         if self._closed:
             return {"error": "The workspace schema is unavailable", "code": "MAXUN_SCHEMA_FAILED"}
         if not self._consume_turn_query_budget(sql_execution=False):
-            return {"error": "The workspace query-tool budget is exhausted", "code": "MAXUN_QUERY_LIMIT"}
+            return {
+                "error": "The workspace query-tool budget is exhausted",
+                "code": "MAXUN_QUERY_LIMIT",
+            }
         if not _QUERY_CAPACITY.acquire(timeout=MAX_QUERY_SECONDS):
             return {"error": "The workspace is busy", "code": "MAXUN_QUERY_BUSY"}
         holder: dict[str, Any] = {"connection": None}
@@ -587,7 +616,12 @@ class MaxunWorkspaceEngine(QueryEngine):
             """Return the schema for the workspace data relation."""
 
             if table.casefold() != "data":
-                return orjson.dumps({"error": "Only the data relation is available", "code": "MAXUN_RELATION_REJECTED"}).decode()
+                return orjson.dumps(
+                    {
+                        "error": "Only the data relation is available",
+                        "code": "MAXUN_RELATION_REJECTED",
+                    }
+                ).decode()
             return orjson.dumps(engine._run_schema()).decode()
 
         @tool
@@ -595,9 +629,16 @@ class MaxunWorkspaceEngine(QueryEngine):
             """Preview a bounded number of rows from the workspace data relation."""
 
             if table.casefold() != "data":
-                return orjson.dumps({"error": "Only the data relation is available", "code": "MAXUN_RELATION_REJECTED"}).decode()
+                return orjson.dumps(
+                    {
+                        "error": "Only the data relation is available",
+                        "code": "MAXUN_RELATION_REJECTED",
+                    }
+                ).decode()
             safe_limit = min(max(int(limit), 1), min(MAX_RESULT_ROWS, 100))
-            return orjson.dumps(engine._run_query(f"SELECT * FROM data LIMIT {safe_limit}")).decode()
+            return orjson.dumps(
+                engine._run_query(f"SELECT * FROM data LIMIT {safe_limit}")
+            ).decode()
 
         return [execute_sql, list_tables, get_schema, preview_table]
 
