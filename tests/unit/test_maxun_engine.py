@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,51 @@ def test_result_row_limit_is_deterministically_truncated(workspace: Path, monkey
         asyncio.run(engine.aclose())
 
 
+def test_global_query_capacity_applies_across_engine_instances(workspace: Path, monkeypatch):
+    capacity = engine_module._QueryCapacity(2)
+    monkeypatch.setattr(engine_module, "_QUERY_CAPACITY", capacity)
+    monkeypatch.setattr(engine_module, "MAX_QUERY_SECONDS", 1.0)
+    engines = [MaxunWorkspaceEngine(IDS["workspace"], root=workspace) for _ in range(3)]
+    active = 0
+    maximum = 0
+    def delayed(sql, holder):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        time.sleep(0.05)
+        active -= 1
+        return {"columns": ["n"], "rows": [{"n": 2}], "truncated": False}
+
+    for item in engines:
+        item._execute_query = delayed
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            results = list(executor.map(lambda item: item._run_query("SELECT COUNT(*) FROM data"), engines))
+        assert all(result["rows"] == [{"n": 2}] for result in results)
+        assert maximum <= 2
+    finally:
+        for item in engines:
+            asyncio.run(item.aclose())
+        capacity.executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_result_cell_limit_is_per_value_not_per_row(workspace: Path, monkeypatch):
+    cell_root = workspace / "cell-limit"
+    Materializer(cell_root).materialize(
+        MaterializationRequest.model_validate(
+            request_body(rows=[{"Price": "x" * 60, "Name": "y" * 60}])
+        )
+    )
+    monkeypatch.setattr(engine_module, "MAX_CELL_BYTES", 100)
+    engine = MaxunWorkspaceEngine(IDS["workspace"], root=cell_root)
+    try:
+        result = engine._run_query('SELECT "Price", "Name" FROM data')
+        assert result["rows"]
+        assert all(len(str(value)) == 60 for row in result["rows"] for value in row.values())
+    finally:
+        asyncio.run(engine.aclose())
+
+
 def test_timeout_returns_sanitized_error(workspace: Path, monkeypatch):
     engine = MaxunWorkspaceEngine(IDS["workspace"], root=workspace)
     original = engine._execute_query
@@ -169,6 +215,18 @@ def test_timeout_returns_sanitized_error(workspace: Path, monkeypatch):
         result = engine._run_query("SELECT COUNT(*) FROM data")
         assert result["code"] == "MAXUN_QUERY_TIMEOUT"
         assert "/" not in result["error"]
+    finally:
+        asyncio.run(engine.aclose())
+
+
+def test_per_turn_tool_budget_limits_sql_execution(workspace: Path):
+    engine = MaxunWorkspaceEngine(IDS["workspace"], root=workspace)
+    engine.configure_turn_budget(max_query_tools=3, max_sql_executions=1)
+    try:
+        execute = next(tool for tool in engine.get_tools() if tool.name == "execute_sql")
+        assert '"rows":[{"count":2}]' in execute.invoke({"sql": "SELECT COUNT(*) AS count FROM data"})
+        blocked = execute.invoke({"sql": "SELECT COUNT(*) AS count FROM data"})
+        assert 'MAXUN_QUERY_LIMIT' in blocked
     finally:
         asyncio.run(engine.aclose())
 

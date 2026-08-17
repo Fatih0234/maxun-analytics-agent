@@ -192,6 +192,17 @@ def test_materialization_is_isolated_deterministic_and_idempotent(tmp_path: Path
     assert not database.exists()
 
 
+def test_idempotent_materialization_refreshes_artifact_lease(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    database = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    old = time.time() - 120
+    os.utime(database, (old, old))
+    materializer.materialize(request)
+    assert database.stat().st_mtime > old
+
+
 def test_empty_sources_preserve_schema_and_manifests(tmp_path: Path):
     body = payload()
     body["sources"][0]["projection"]["rows"] = []

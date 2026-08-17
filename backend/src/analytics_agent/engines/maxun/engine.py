@@ -14,6 +14,7 @@ import contextlib
 import datetime as dt
 import decimal
 import logging
+import os
 import stat
 import threading
 from pathlib import Path
@@ -38,7 +39,20 @@ MAX_RESULT_COLUMNS = 100
 MAX_RESULT_BYTES = 1_048_576
 MAX_CELL_BYTES = 65_536
 MAX_QUERY_SECONDS = 10.0
-MAX_CONCURRENT_QUERIES = 2
+
+
+def _query_concurrency_from_env() -> int:
+    raw = os.environ.get("MAXUN_QUERY_CONCURRENCY", "2").strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("MAXUN_QUERY_CONCURRENCY must be an integer") from error
+    if not 1 <= value <= 32:
+        raise ValueError("MAXUN_QUERY_CONCURRENCY must be between 1 and 32")
+    return value
+
+
+MAX_CONCURRENT_QUERIES = _query_concurrency_from_env()
 MAX_MEMORY_LIMIT = "512MB"
 MAX_TEMP_DIRECTORY_SIZE = "1GB"
 MAX_THREADS = 2
@@ -297,6 +311,36 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
+class _QueryCapacity:
+    """Process-wide bounded capacity for all Maxun DuckDB statements."""
+
+    def __init__(self, limit: int) -> None:
+        self.semaphore = threading.BoundedSemaphore(limit)
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=limit,
+            thread_name_prefix="maxun-duckdb",
+        )
+
+    def acquire(self, timeout: float) -> bool:
+        return self.semaphore.acquire(timeout=timeout)
+
+    def release(self) -> None:
+        self.semaphore.release()
+
+    def submit(self, function, *args):
+        return self.executor.submit(function, *args)
+
+    def shutdown(self) -> None:
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+
+_QUERY_CAPACITY = _QueryCapacity(MAX_CONCURRENT_QUERIES)
+
+
+def shutdown_query_capacity() -> None:
+    _QUERY_CAPACITY.shutdown()
+
+
 class MaxunWorkspaceEngine(QueryEngine):
     """A single workspace-bound, read-only DuckDB query engine."""
 
@@ -321,12 +365,12 @@ class MaxunWorkspaceEngine(QueryEngine):
             expected_signature,
             expected_version,
         )
-        self._capacity = threading.BoundedSemaphore(MAX_CONCURRENT_QUERIES)
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=MAX_CONCURRENT_QUERIES,
-            thread_name_prefix="maxun-duckdb",
-        )
         self._closed = False
+        self._turn_query_tool_limit: int | None = None
+        self._turn_sql_limit: int | None = None
+        self._turn_query_tool_attempts = 0
+        self._turn_sql_attempts = 0
+        self._turn_budget_lock = threading.Lock()
 
     @classmethod
     def from_engine_name(
@@ -366,12 +410,12 @@ class MaxunWorkspaceEngine(QueryEngine):
                 if len(rows) >= MAX_RESULT_ROWS:
                     truncated = True
                     break
-                row = {
-                    column: _json_value(value)
-                    for column, value in zip(columns, raw_row, strict=False)
-                }
-                if len(orjson.dumps(row)) > MAX_CELL_BYTES:
-                    raise MaxunQueryError("MAXUN_RESULT_LIMIT", "A result cell is too large")
+                row = {}
+                for column, value in zip(columns, raw_row, strict=False):
+                    normalized = _json_value(value)
+                    if len(orjson.dumps(normalized)) > MAX_CELL_BYTES:
+                        raise MaxunQueryError("MAXUN_RESULT_LIMIT", "A result cell is too large")
+                    row[column] = normalized
                 rows.append(row)
                 if len(orjson.dumps({"columns": columns, "rows": rows})) > MAX_RESULT_BYTES:
                     rows.pop()
@@ -391,14 +435,44 @@ class MaxunWorkspaceEngine(QueryEngine):
                 connection.close()
             holder["connection"] = None
 
-    def _run_query(self, sql: str) -> dict[str, Any]:
+    def configure_turn_budget(self, *, max_query_tools: int = 3, max_sql_executions: int = 1) -> None:
+        if max_query_tools < 1 or max_sql_executions < 1:
+            raise ValueError("Maxun turn query budgets must be positive")
+        with self._turn_budget_lock:
+            self._turn_query_tool_limit = max_query_tools
+            self._turn_sql_limit = max_sql_executions
+            self._turn_query_tool_attempts = 0
+            self._turn_sql_attempts = 0
+
+    def _consume_turn_query_budget(self, *, sql_execution: bool) -> bool:
+        with self._turn_budget_lock:
+            if self._turn_query_tool_limit is None or self._turn_sql_limit is None:
+                return True
+            if self._turn_query_tool_attempts >= self._turn_query_tool_limit:
+                return False
+            if sql_execution and self._turn_sql_attempts >= self._turn_sql_limit:
+                return False
+            self._turn_query_tool_attempts += 1
+            if sql_execution:
+                self._turn_sql_attempts += 1
+            return True
+
+    def _run_query(self, sql: str, *, sql_execution: bool = False) -> dict[str, Any]:
         if self._closed:
             return {"error": "The workspace query could not be completed", "code": "MAXUN_ENGINE_CLOSED"}
+        if not self._consume_turn_query_budget(sql_execution=sql_execution):
+            return {
+                "error": "The workspace query-tool budget is exhausted",
+                "code": "MAXUN_QUERY_LIMIT",
+                "columns": [],
+                "rows": [],
+                "truncated": False,
+            }
         try:
             normalized = validate_sql(sql)
         except MaxunQueryError as error:
             return {"error": error.message, "code": error.code, "columns": [], "rows": [], "truncated": False}
-        if not self._capacity.acquire(timeout=MAX_QUERY_SECONDS):
+        if not _QUERY_CAPACITY.acquire(timeout=MAX_QUERY_SECONDS):
             return {
                 "error": "The workspace is busy",
                 "code": "MAXUN_QUERY_BUSY",
@@ -408,7 +482,20 @@ class MaxunWorkspaceEngine(QueryEngine):
             }
 
         holder: dict[str, Any] = {"connection": None}
-        future = self._executor.submit(self._execute_query, normalized, holder)
+        try:
+            future = _QUERY_CAPACITY.submit(self._execute_query, normalized, holder)
+        except Exception:
+            _QUERY_CAPACITY.release()
+            return {
+                "error": "The workspace query could not be completed",
+                "code": "MAXUN_QUERY_FAILED",
+                "columns": [],
+                "rows": [],
+                "truncated": False,
+            }
+        # Release capacity only after the worker has actually finished. A
+        # timed-out DuckDB statement may still be unwinding after interrupt().
+        future.add_done_callback(lambda _completed: _QUERY_CAPACITY.release())
         try:
             return future.result(timeout=MAX_QUERY_SECONDS)
         except concurrent.futures.TimeoutError:
@@ -437,8 +524,48 @@ class MaxunWorkspaceEngine(QueryEngine):
                 "rows": [],
                 "truncated": False,
             }
+
+    def _execute_schema(self, holder: dict[str, Any]) -> list[dict[str, Any]]:
+        connection: duckdb.DuckDBPyConnection | None = None
+        try:
+            connection = duckdb.connect(str(self._artifact), read_only=True)
+            holder["connection"] = connection
+            _configure_read_only(connection)
+            cursor = connection.execute("SELECT * FROM data LIMIT 0")
+            return [
+                {"name": str(column[0]), "type": str(column[1]), "nullable": True}
+                for column in (cursor.description or [])
+            ]
         finally:
-            self._capacity.release()
+            if connection is not None:
+                connection.close()
+            holder["connection"] = None
+
+    def _run_schema(self) -> list[dict[str, Any]] | dict[str, str]:
+        if self._closed:
+            return {"error": "The workspace schema is unavailable", "code": "MAXUN_SCHEMA_FAILED"}
+        if not self._consume_turn_query_budget(sql_execution=False):
+            return {"error": "The workspace query-tool budget is exhausted", "code": "MAXUN_QUERY_LIMIT"}
+        if not _QUERY_CAPACITY.acquire(timeout=MAX_QUERY_SECONDS):
+            return {"error": "The workspace is busy", "code": "MAXUN_QUERY_BUSY"}
+        holder: dict[str, Any] = {"connection": None}
+        try:
+            future = _QUERY_CAPACITY.submit(self._execute_schema, holder)
+        except Exception:
+            _QUERY_CAPACITY.release()
+            return {"error": "The workspace schema is unavailable", "code": "MAXUN_SCHEMA_FAILED"}
+        future.add_done_callback(lambda _completed: _QUERY_CAPACITY.release())
+        try:
+            return future.result(timeout=MAX_QUERY_SECONDS)
+        except concurrent.futures.TimeoutError:
+            connection = holder.get("connection")
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    connection.interrupt()
+            future.cancel()
+            return {"error": "The workspace schema is unavailable", "code": "MAXUN_SCHEMA_FAILED"}
+        except Exception:
+            return {"error": "The workspace schema is unavailable", "code": "MAXUN_SCHEMA_FAILED"}
 
     def get_tools(self) -> list[BaseTool]:
         engine = self
@@ -447,7 +574,7 @@ class MaxunWorkspaceEngine(QueryEngine):
         def execute_sql(sql: str) -> str:
             """Execute one approved read-only SQL query against the workspace data relation."""
 
-            return orjson.dumps(engine._run_query(sql)).decode()
+            return orjson.dumps(engine._run_query(sql, sql_execution=True)).decode()
 
         @tool
         def list_tables() -> str:
@@ -461,17 +588,7 @@ class MaxunWorkspaceEngine(QueryEngine):
 
             if table.casefold() != "data":
                 return orjson.dumps({"error": "Only the data relation is available", "code": "MAXUN_RELATION_REJECTED"}).decode()
-            try:
-                with duckdb.connect(str(engine._artifact), read_only=True) as connection:
-                    _configure_read_only(connection)
-                    cursor = connection.execute("SELECT * FROM data LIMIT 0")
-                    result = [
-                        {"name": str(column[0]), "type": str(column[1]), "nullable": True}
-                        for column in (cursor.description or [])
-                    ]
-                return orjson.dumps(result).decode()
-            except Exception:
-                return orjson.dumps({"error": "The workspace schema is unavailable", "code": "MAXUN_SCHEMA_FAILED"}).decode()
+            return orjson.dumps(engine._run_schema()).decode()
 
         @tool
         def preview_table(table: str = "data", limit: int = 10) -> str:
@@ -485,9 +602,9 @@ class MaxunWorkspaceEngine(QueryEngine):
         return [execute_sql, list_tables, get_schema, preview_table]
 
     async def aclose(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self._executor.shutdown(wait=True, cancel_futures=True)
+        # Query capacity is process-scoped and intentionally outlives each
+        # request-scoped engine. The application owns process shutdown.
+        self._closed = True
 
 
 __all__ = [

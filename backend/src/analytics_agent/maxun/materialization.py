@@ -557,6 +557,10 @@ class Materializer:
                     with duckdb.connect(str(final), read_only=True) as existing:
                         found = _manifest(existing)
                         if found and found.get("input_digest") == digest:
+                            # A successful integrity-checked access is a lease
+                            # refresh for the disposable artifact. Cleanup is
+                            # serialized by this same workspace lock.
+                            os.utime(final, None)
                             return self._response(request, digest, found, existing)
                         if found and found.get("data_signature") == request.workspace.dataSignature:
                             raise MaterializationError(

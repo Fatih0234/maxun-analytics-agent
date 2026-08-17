@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import logging
 import os
@@ -22,14 +23,15 @@ from typing import Any
 import orjson
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import IntegrityError
 
 from analytics_agent.agent.graph import build_graph
 from analytics_agent.agent.history import build_history
 from analytics_agent.agent.streaming import stream_graph_events
 from analytics_agent.config import settings
 from analytics_agent.db.base import _get_session_factory
-from analytics_agent.db.models import Conversation, Message
-from analytics_agent.db.repository import ConversationRepo, MessageRepo
+from analytics_agent.db.models import Conversation, MaxunTurn, Message
+from analytics_agent.db.repository import ConversationRepo, MaxunTurnRepo, MessageRepo
 from analytics_agent.engines.maxun.engine import MaxunQueryError
 from analytics_agent.engines.resolver import resolve_engine
 from analytics_agent.maxun.materialization import configured_token
@@ -43,6 +45,7 @@ _UUID_RE = re.compile(
 _SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_ANSWER_CHARS = 12_000
 _MAX_QUESTION_CHARS = 4_000
+_MAXUN_TURN_PROCESSING_TTL_SECONDS = 15 * 60
 
 # The supported deployment is single-replica for this phase. The lock prevents
 # duplicate in-flight turns inside one Agent process; Maxun's idempotency and
@@ -62,6 +65,7 @@ class MaxunConversationCreate(BaseModel):
 class MaxunTurnRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    maxun_turn_id: str = Field(min_length=1, max_length=255)
     workspace_id: str
     workspace_version: int = Field(ge=1)
     data_signature: str
@@ -84,6 +88,28 @@ def _validate_snapshot(workspace_id: str, version: int, signature: str) -> None:
         raise HTTPException(status_code=400, detail={"code": "MAXUN_SNAPSHOT_INVALID"})
     if version < 1 or not _SIGNATURE_RE.fullmatch(signature):
         raise HTTPException(status_code=400, detail={"code": "MAXUN_SNAPSHOT_INVALID"})
+
+
+def _request_digest(request: MaxunTurnRequest) -> str:
+    canonical = "\x1f".join(
+        (
+            request.workspace_id,
+            str(request.workspace_version),
+            request.data_signature,
+            request.question.strip(),
+        )
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _stored_turn_result(record: MaxunTurn) -> dict[str, Any] | None:
+    if record.status not in {"completed", "error"} or not record.result_json:
+        return None
+    try:
+        value = orjson.loads(record.result_json)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _safe_error(error: BaseException) -> dict[str, str]:
@@ -164,10 +190,20 @@ async def _mock_maxun_events(
     yield {"event": "COMPLETE", "conversation_id": conversation_id, "payload": {"text": answer}}
 
 
+def _configure_maxun_turn_budget(engine: Any) -> None:
+    configure = getattr(engine, "configure_turn_budget", None)
+    if callable(configure):
+        configure(max_query_tools=3, max_sql_executions=1)
+
+
 def _result_from_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     answer_parts: list[str] = []
     sql_result: dict[str, Any] | None = None
+    sql_fingerprints: set[str] = set()
+    successful_sql_count = 0
+    tool_error = False
     failed = False
+    failure_code = "MAXUN_TURN_FAILED"
     for event in events:
         event_type = event.get("event")
         payload = event.get("payload") or {}
@@ -176,17 +212,35 @@ def _result_from_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(text, str):
                 answer_parts.append(text)
         elif event_type == "SQL":
-            sql_result = {
-                "sql": payload.get("sql", ""),
-                "columns": payload.get("columns", []),
-                "rows": payload.get("rows", []),
-                "truncated": bool(payload.get("truncated", False)),
-            }
+            sql = payload.get("sql")
+            if isinstance(sql, str) and sql.strip():
+                candidate = {
+                    "sql": sql,
+                    "columns": payload.get("columns", []),
+                    "rows": payload.get("rows", []),
+                    "truncated": bool(payload.get("truncated", False)),
+                }
+                fingerprint = repr(candidate)
+                if fingerprint not in sql_fingerprints:
+                    sql_fingerprints.add(fingerprint)
+                    successful_sql_count += 1
+                    sql_result = candidate
+        elif event_type == "TOOL_RESULT" and payload.get("is_error"):
+            tool_error = True
+            failure_code = "MAXUN_QUERY_FAILED"
         elif event_type == "ERROR":
             failed = True
+            failure_code = "MAXUN_TURN_FAILED"
+
+    if not failed and successful_sql_count == 0:
+        failed = True
+        failure_code = "MAXUN_QUERY_FAILED" if tool_error else "MAXUN_QUERY_REQUIRED"
+    elif not failed and successful_sql_count > 1:
+        failed = True
+        failure_code = "MAXUN_QUERY_LIMIT"
 
     answer = "".join(answer_parts).strip()[:_MAX_ANSWER_CHARS]
-    return {
+    result = {
         "status": "error" if failed else "completed",
         "answer": answer,
         "sql": sql_result.get("sql") if sql_result else None,
@@ -194,6 +248,9 @@ def _result_from_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "rows": sql_result.get("rows", []) if sql_result else [],
         "truncated": sql_result.get("truncated", False) if sql_result else False,
     }
+    if failed:
+        result["error"] = {"code": failure_code, "message": "The workspace question could not be completed"}
+    return result
 
 
 async def _run_turn(
@@ -209,6 +266,51 @@ async def _run_turn(
         expected_engine = f"maxun:{request.workspace_id}"
         if conversation.engine_name != expected_engine:
             raise HTTPException(status_code=409, detail={"code": "MAXUN_CONVERSATION_BINDING_MISMATCH"})
+
+        maxun_turn_repo = MaxunTurnRepo(session)
+        request_digest = _request_digest(request)
+        existing_turn = await maxun_turn_repo.get(conversation_id, request.maxun_turn_id)
+        if existing_turn:
+            if existing_turn.request_digest != request_digest:
+                raise HTTPException(status_code=409, detail={"code": "MAXUN_TURN_ID_REUSED"})
+            replay = _stored_turn_result(existing_turn)
+            if replay is not None:
+                return replay
+            updated_at = existing_turn.updated_at
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=UTC)
+            age = (datetime.now(UTC) - updated_at).total_seconds()
+            if age < _MAXUN_TURN_PROCESSING_TTL_SECONDS:
+                raise HTTPException(status_code=409, detail={"code": "MAXUN_TURN_IN_PROGRESS"})
+            maxun_turn = existing_turn
+            maxun_turn.status = "processing"
+            maxun_turn.result_json = None
+            maxun_turn.updated_at = datetime.now(UTC)
+            await session.commit()
+        else:
+            maxun_turn = MaxunTurn(
+                id=str(uuid.uuid4()),
+                conversation_id=conversation_id,
+                maxun_turn_id=request.maxun_turn_id,
+                request_digest=request_digest,
+                status="processing",
+                result_json=None,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(maxun_turn)
+                    await session.flush()
+            except IntegrityError:
+                existing_turn = await maxun_turn_repo.get(conversation_id, request.maxun_turn_id)
+                if existing_turn and existing_turn.request_digest == request_digest:
+                    replay = _stored_turn_result(existing_turn)
+                    if replay is not None:
+                        return replay
+                    raise HTTPException(status_code=409, detail={"code": "MAXUN_TURN_IN_PROGRESS"})
+                raise HTTPException(status_code=409, detail={"code": "MAXUN_TURN_ID_REUSED"})
+            await session.commit()
 
         message_repo = MessageRepo(session)
         prior_messages = await message_repo.list_for_conversation(conversation_id)
@@ -231,9 +333,13 @@ async def _run_turn(
                 maxun_workspace_signature=request.data_signature,
                 maxun_workspace_version=request.workspace_version,
             )
+            _configure_maxun_turn_budget(engine)
+            from analytics_agent.agent.compactor_registry import get_compactor
+
             history = build_history(
                 prior_messages,
                 request.question.strip(),
+                compactor=get_compactor(),
                 max_history_tokens=settings.max_history_tokens,
             )
             if os.environ.get("MOCK_LLM") == "1":
@@ -298,7 +404,13 @@ async def _run_turn(
 
         result = _result_from_events(events)
         if result["status"] == "error":
-            result["error"] = {"code": "MAXUN_TURN_FAILED", "message": "The workspace question could not be completed"}
+            result["error"] = result.get("error") or {
+                "code": "MAXUN_TURN_FAILED",
+                "message": "The workspace question could not be completed",
+            }
+        maxun_turn.status = result["status"]
+        maxun_turn.result_json = orjson.dumps(result).decode()
+        maxun_turn.updated_at = datetime.now(UTC)
         session.add(
             # Touching the row here avoids a second commit through the generic
             # repository and keeps the turn's history atomic.
@@ -363,6 +475,31 @@ async def create_conversation(
                     await engine.aclose()
 
 
+@router.delete("/{conversation_id}", status_code=204)
+async def delete_conversation(
+    conversation_id: str,
+    authorization: str | None = Header(default=None),
+) -> None:
+    _internal_authorized(authorization)
+    if not _UUID_RE.fullmatch(conversation_id):
+        raise HTTPException(status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"})
+
+    lock = _lock_for(conversation_id)
+    try:
+        async with lock:
+            factory = _get_session_factory()
+            async with factory() as session:
+                repo = ConversationRepo(session)
+                conversation = await repo.get(conversation_id)
+                if not conversation:
+                    return
+                if not conversation.engine_name.startswith("maxun:"):
+                    raise HTTPException(status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"})
+                await repo.delete(conversation_id)
+    finally:
+        _turn_locks.pop(conversation_id, None)
+
+
 @router.post("/{conversation_id}/turns")
 async def create_turn(
     conversation_id: str,
@@ -371,6 +508,8 @@ async def create_turn(
 ) -> dict[str, Any]:
     _internal_authorized(authorization)
     _validate_snapshot(body.workspace_id, body.workspace_version, body.data_signature)
+    if not _UUID_RE.fullmatch(body.maxun_turn_id):
+        raise HTTPException(status_code=400, detail={"code": "MAXUN_TURN_ID_INVALID"})
     if not _UUID_RE.fullmatch(conversation_id):
         raise HTTPException(status_code=404, detail={"code": "MAXUN_CONVERSATION_NOT_FOUND"})
 

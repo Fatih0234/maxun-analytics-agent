@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from analytics_agent.db.types import EncryptedJSON
@@ -118,6 +118,36 @@ class Conversation(Base):
         back_populates="conversation",
         cascade="all, delete-orphan",
         order_by="Message.sequence",
+    )
+    maxun_turns: Mapped[list[MaxunTurn]] = relationship(
+        "MaxunTurn",
+        cascade="all, delete-orphan",
+    )
+
+
+class MaxunTurn(Base):
+    """Durable idempotency/result record for a Maxun-owned turn."""
+
+    __tablename__ = "maxun_turns"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "maxun_turn_id",
+            name="uq_maxun_turn_conversation_request",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    maxun_turn_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="processing")
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
 
 

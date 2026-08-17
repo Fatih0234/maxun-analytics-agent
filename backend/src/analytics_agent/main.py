@@ -182,8 +182,10 @@ async def lifespan(app: FastAPI):
             await materialization_cleanup_task
 
     from analytics_agent.engines.factory import close_all
+    from analytics_agent.engines.maxun.engine import shutdown_query_capacity
 
     await close_all()
+    await asyncio.to_thread(shutdown_query_capacity)
 
 
 async def _check_encryption_key_consistency() -> None:
