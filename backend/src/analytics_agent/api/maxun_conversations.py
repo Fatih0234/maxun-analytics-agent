@@ -18,7 +18,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import orjson
 from fastapi import APIRouter, Header, HTTPException
@@ -390,7 +390,10 @@ async def _run_turn(
                 events.append(event)
                 if event_type in {"TEXT", "TOOL_CALL", "TOOL_RESULT", "SQL", "ERROR", "COMPLETE"}:
                     role = "assistant"
-                    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                    payload = cast(
+                        dict[str, Any],
+                        event.get("payload") if isinstance(event.get("payload"), dict) else {},
+                    )
                     session.add(_new_message(conversation_id, event_type, role, payload, sequence))
                     sequence += 1
         except Exception as error:
