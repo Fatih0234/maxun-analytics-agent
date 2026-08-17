@@ -466,7 +466,11 @@ async def test_turn_history_messages_are_correlated_once(app_and_db):
     assert replay.json()["status"] == "completed"
     async with factory() as session:
         rows_after_replay = list(
-            (await session.execute(select(Message).where(Message.conversation_id == conversation_id)))
+            (
+                await session.execute(
+                    select(Message).where(Message.conversation_id == conversation_id)
+                )
+            )
             .scalars()
             .all()
         )
@@ -638,10 +642,15 @@ async def test_internal_maxun_conversation_delete_is_idempotent(app_and_db):
         from sqlalchemy import select
 
         assert await ConversationRepo(session).get(conversation_id) is None
-        assert (await session.execute(select(MaxunTurn).where(MaxunTurn.conversation_id == conversation_id))).scalars().all() == []
-        assert (await session.execute(select(Message).where(Message.conversation_id == conversation_id))).scalars().all() == []
+        assert (
+            await session.execute(
+                select(MaxunTurn).where(MaxunTurn.conversation_id == conversation_id)
+            )
+        ).scalars().all() == []
+        assert (
+            await session.execute(select(Message).where(Message.conversation_id == conversation_id))
+        ).scalars().all() == []
         assert (await session.execute(select(MaxunTurnEvent))).scalars().all() == []
-
 
 
 @pytest.mark.asyncio
