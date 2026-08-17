@@ -51,6 +51,20 @@ jobs:
   backend-integration:
     name: Backend — MCP transport integration tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: phase5
+          POSTGRES_PASSWORD: phase5
+          POSTGRES_DB: phase5
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U phase5 -d phase5"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +78,11 @@ jobs:
 
       - name: Run MCP transport integration tests
         run: uv run pytest tests/integration/test_mcp_transports.py -v
+
+      - name: Run PostgreSQL resumable-turn concurrency tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://phase5:phase5@127.0.0.1:5432/phase5
+        run: uv run pytest tests/integration/test_maxun_turn_events_postgres.py -v
 
   # ── Playwright e2e ──────────────────────────────────────────────────────────
   e2e:

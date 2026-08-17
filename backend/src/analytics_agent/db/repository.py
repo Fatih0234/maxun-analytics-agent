@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,7 @@ from analytics_agent.db.models import (
     Integration,
     IntegrationCredential,
     MaxunTurn,
+    MaxunTurnEvent,
     Message,
     Setting,
 )
@@ -97,6 +99,57 @@ class MaxunTurnRepo:
             )
         )
         return result.scalar_one_or_none()
+
+    async def get_by_id(self, turn_record_id: str) -> MaxunTurn | None:
+        result = await self._session.execute(
+            select(MaxunTurn).where(MaxunTurn.id == turn_record_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def list_events(
+        self,
+        turn_record_id: str,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> list[MaxunTurnEvent]:
+        result = await self._session.execute(
+            select(MaxunTurnEvent)
+            .where(
+                MaxunTurnEvent.turn_record_id == turn_record_id,
+                MaxunTurnEvent.sequence > after_sequence,
+            )
+            .order_by(MaxunTurnEvent.sequence)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def append_event(
+        self,
+        turn_record_id: str,
+        event_type: str,
+        payload: str,
+    ) -> MaxunTurnEvent:
+        async with self._session.begin():
+            result = await self._session.execute(
+                select(MaxunTurn).where(MaxunTurn.id == turn_record_id).with_for_update()
+            )
+            turn = result.scalar_one_or_none()
+            if turn is None:
+                raise ValueError("Maxun turn does not exist")
+            sequence = turn.next_event_sequence
+            turn.next_event_sequence = sequence + 1
+            turn.updated_at = datetime.now(UTC)
+            event = MaxunTurnEvent(
+                id=str(uuid4()),
+                turn_record_id=turn_record_id,
+                sequence=sequence,
+                event_type=event_type,
+                payload=payload,
+                created_at=datetime.now(UTC),
+            )
+            self._session.add(event)
+            await self._session.flush()
+        return event
 
 
 class MessageRepo:

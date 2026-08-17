@@ -41,6 +41,8 @@ def test_run_migrations_creates_tables(sqlite_db, monkeypatch):
     assert "integrations" in tables
     assert "context_platforms" in tables
     assert "settings" in tables
+    assert "maxun_turns" in tables
+    assert "maxun_turn_events" in tables
 
 
 def test_run_migrations_works_without_alembic_ini_in_cwd(sqlite_db, monkeypatch, tmp_path):
