@@ -244,6 +244,84 @@ async def test_resumable_turn_events_replay_from_sequence(app_and_db):
 
 
 @pytest.mark.asyncio
+async def test_duplicate_turn_admission_does_not_start_duplicate_provider_execution(
+    app_and_db, monkeypatch
+):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    provider_calls = 0
+
+    async def blocked_events(**kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        started.set()
+        await release.wait()
+        yield {
+            "event": "SQL",
+            "payload": {
+                "sql": "SELECT COUNT(*) FROM data",
+                "columns": ["count"],
+                "rows": [{"count": 2}],
+            },
+        }
+        yield {"event": "TEXT", "payload": {"text": "There are 2 rows."}}
+
+    monkeypatch.setattr(adapter, "stream_graph_events", blocked_events)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    created = await _request(
+        app_and_db,
+        "POST",
+        "/internal/maxun/conversations",
+        headers=headers,
+        json={"workspace_id": WORKSPACE_ID, "workspace_version": 1, "data_signature": SIGNATURE},
+    )
+    conversation_id = created.json()["conversation_id"]
+    turn_id = "99999999-9999-4999-8999-999999999993"
+    body = {
+        "maxun_turn_id": turn_id,
+        "workspace_id": WORKSPACE_ID,
+        "workspace_version": 1,
+        "data_signature": SIGNATURE,
+        "question": "How many rows?",
+    }
+
+    first = await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}",
+        headers=headers,
+        json=body,
+    )
+    assert first.status_code == 200
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    duplicate = await _request(
+        app_and_db,
+        "PUT",
+        f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}",
+        headers=headers,
+        json=body,
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["attempt"] == first.json()["attempt"] == 1
+    assert provider_calls == 1
+
+    release.set()
+    for _ in range(20):
+        status = await _request(
+            app_and_db,
+            "GET",
+            f"/internal/maxun/conversations/{conversation_id}/turns/{turn_id}/events?after=0",
+            headers=headers,
+        )
+        if status.json()["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+    assert status.json()["status"] == "completed"
+    assert provider_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_resumable_turn_rejects_maxun_turn_id_reuse(app_and_db):
     headers = {"Authorization": f"Bearer {TOKEN}"}
     created = await _request(
