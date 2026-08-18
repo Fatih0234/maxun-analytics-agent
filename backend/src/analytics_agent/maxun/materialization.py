@@ -721,6 +721,15 @@ class Materializer:
         if not 0.1 <= wait_seconds <= 300:
             raise ValueError("MAXUN_MATERIALIZATION_WAIT_SECONDS must be between 0.1 and 300")
         self._wait_seconds = wait_seconds
+        self._require_artifact_mac = (
+            os.environ.get("MAXUN_REQUIRE_ARTIFACT_MAC", "false").lower() == "true"
+        )
+        raw_mac_key = os.environ.get("MAXUN_ARTIFACT_INTEGRITY_KEY", "").strip()
+        if self._require_artifact_mac and not raw_mac_key:
+            raise ValueError(
+                "MAXUN_ARTIFACT_INTEGRITY_KEY is required when artifact MAC is enabled"
+            )
+        self._artifact_mac_key = raw_mac_key.encode("utf-8") if raw_mac_key else None
         self._semaphore = threading.BoundedSemaphore(concurrency)
         self._operations: dict[str, _MaterializationOperation] = {}
         self._cancelled_operations: dict[str, float] = {}
@@ -812,6 +821,43 @@ class Materializer:
         finally:
             self._semaphore.release()
 
+    def _artifact_mac_path(self, artifact: Path) -> Path:
+        return artifact.with_name(f"{artifact.name}.mac")
+
+    def _artifact_mac(self, artifact: Path) -> str:
+        if self._artifact_mac_key is None:
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH", "artifact integrity is unavailable", 503
+            )
+        digest = hmac.new(self._artifact_mac_key, digestmod=hashlib.sha256)
+        with artifact.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _write_artifact_mac(self, artifact: Path, mac_path: Path) -> None:
+        expected = self._artifact_mac(artifact)
+        with mac_path.open("x", encoding="ascii") as handle:
+            handle.write(expected)
+        mac_path.chmod(0o600)
+
+    def _verify_artifact_mac(self, artifact: Path) -> None:
+        if not self._require_artifact_mac:
+            return
+        mac_path = self._artifact_mac_path(artifact)
+        _validate_regular_file(mac_path)
+        try:
+            stored = mac_path.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError) as error:
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH", "artifact integrity is unavailable", 503
+            ) from error
+        expected = self._artifact_mac(artifact)
+        if not hmac.compare_digest(stored, expected):
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH", "artifact integrity verification failed", 503
+            )
+
     def _paths(self, workspace_id: str) -> tuple[Path, Path, Path]:
         workspace = str(_uuid(workspace_id))
         version = self.root / "v1"
@@ -846,6 +892,7 @@ class Materializer:
                 _ensure_directory(directory)
                 _validate_regular_file(final, allow_missing=True)
                 if final.exists():
+                    self._verify_artifact_mac(final)
                     try:
                         with duckdb.connect(str(final), read_only=True) as existing:
                             found = _manifest(existing)
@@ -870,15 +917,22 @@ class Materializer:
                     except Exception:
                         final.unlink(missing_ok=True)
                 temp = directory / f"workspace.tmp.{secrets.token_hex(12)}.duckdb"
+                temp_mac = self._artifact_mac_path(temp)
                 try:
                     response = self._build(request, digest, temp, operation)
                     _validate_regular_file(temp)
+                    if self._require_artifact_mac:
+                        self._write_artifact_mac(temp, temp_mac)
                     operation.check()
                     os.replace(temp, final)
+                    if self._require_artifact_mac:
+                        os.replace(temp_mac, self._artifact_mac_path(final))
                     _validate_regular_file(final)
+                    self._verify_artifact_mac(final)
                     return response
                 except Exception:
                     temp.unlink(missing_ok=True)
+                    temp_mac.unlink(missing_ok=True)
                     raise
         finally:
             self._finish_operation(operation)
@@ -1101,6 +1155,7 @@ class Materializer:
         directory, final, _ = self._paths(workspace_id)
         _validate_directory(directory)
         _validate_regular_file(final)
+        self._verify_artifact_mac(final)
         return final
 
     def delete(self, workspace_id: str) -> None:
@@ -1115,6 +1170,7 @@ class Materializer:
         return (
             path.name == "workspace.duckdb"
             or path.name == "workspace.duckdb.wal"
+            or path.name == "workspace.duckdb.mac"
             or path.name == "workspace.lock"
             or path.name.startswith("workspace.tmp.")
         )

@@ -455,6 +455,29 @@ def test_digest_matches_cross_runtime_golden_vector():
     )
 
 
+def test_artifact_mac_is_required_when_enabled(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MAXUN_REQUIRE_ARTIFACT_MAC", "true")
+    monkeypatch.delenv("MAXUN_ARTIFACT_INTEGRITY_KEY", raising=False)
+    with pytest.raises(ValueError, match="ARTIFACT_INTEGRITY_KEY"):
+        Materializer(tmp_path)
+
+
+def test_artifact_mac_detects_volume_writer_tampering(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MAXUN_REQUIRE_ARTIFACT_MAC", "true")
+    monkeypatch.setenv("MAXUN_ARTIFACT_INTEGRITY_KEY", "dedicated-phase7-mac-key")
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    artifact = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    mac = artifact.with_name("workspace.duckdb.mac")
+    assert mac.stat().st_mode & 0o777 == 0o600
+    with artifact.open("ab") as handle:
+        handle.write(b"tampered")
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(request)
+    assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+
+
 def test_materialization_rejects_symlinked_workspace_directory(tmp_path: Path):
     materializer = Materializer(tmp_path)
     outside = tmp_path / "outside"

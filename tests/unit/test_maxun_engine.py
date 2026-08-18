@@ -133,6 +133,19 @@ def test_ast_policy_rejects_external_access_writes_and_fallbacks(sql: str):
         validate_sql(sql)
 
 
+def test_engine_rejects_tampered_artifact_mac(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MAXUN_REQUIRE_ARTIFACT_MAC", "true")
+    monkeypatch.setenv("MAXUN_ARTIFACT_INTEGRITY_KEY", "dedicated-phase7-mac-key")
+    request = MaterializationRequest.model_validate(request_body())
+    Materializer(tmp_path).materialize(request)
+    artifact = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    with artifact.open("ab") as handle:
+        handle.write(b"tampered")
+    with pytest.raises(MaxunQueryError) as error:
+        MaxunWorkspaceEngine(IDS["workspace"], root=tmp_path)
+    assert error.value.code == "MAXUN_WORKSPACE_INTEGRITY"
+
+
 def test_workspace_symlink_cannot_escape_controlled_root(workspace: Path, tmp_path: Path):
     workspace_dir = workspace / "v1" / IDS["workspace"]
     artifact = workspace_dir / "workspace.duckdb"

@@ -125,15 +125,17 @@ def _workspace_artifact_path(workspace_id: str, root: str | Path | None = None) 
     """
 
     canonical = _canonical_workspace_id(workspace_id)
-    materializer = Materializer(root)
     try:
+        materializer = Materializer(root)
         return materializer.artifact_path(canonical)
-    except MaterializationError as error:
+    except (MaterializationError, ValueError) as error:
         code = (
             "MAXUN_WORKSPACE_INTEGRITY"
-            if error.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+            if isinstance(error, MaterializationError)
+            and error.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
             else "MAXUN_WORKSPACE_INVALID"
-            if error.code == "MATERIALIZATION_INVALID_CONTRACT"
+            if isinstance(error, MaterializationError)
+            and error.code == "MATERIALIZATION_INVALID_CONTRACT"
             else "MAXUN_WORKSPACE_UNAVAILABLE"
         )
         raise MaxunQueryError(code, "Workspace data is unavailable") from error
