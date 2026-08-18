@@ -106,17 +106,21 @@ async def propagate_datahub_env() -> None:
 async def lifespan(app: FastAPI):
     from analytics_agent.build_identity import validate_build_identity
 
+    maxun_only = getattr(app.state, "analytics_agent_profile", "general") == "maxun"
     validate_build_identity()
 
-    # Fail fast if rows are encrypted but the master key is absent.
-    # Must run BEFORE any DB read that would deserialize EncryptedJSON columns.
-    await _check_encryption_key_consistency()
+    # Fail fast if rows are encrypted but the master key is absent. The
+    # general profile must run this before context-platform DB reads; the
+    # Maxun profile never initializes that generic surface.
+    if not maxun_only:
+        await _check_encryption_key_consistency()
 
     # Per-pod read-only init. All DB-mutating bootstrap work (migrations,
     # yaml→DB seeds, first-run defaults) is now done by the analytics-agent
     # CLI, run as a Helm pre-install/pre-upgrade hook.
-    await register_engines_from_db()
-    await propagate_datahub_env()
+    if not maxun_only:
+        await register_engines_from_db()
+        await propagate_datahub_env()
     await _load_llm_config_from_db()
 
     # Derived Maxun workspaces are disposable cache entries. Cleanup is best
@@ -154,13 +158,20 @@ async def lifespan(app: FastAPI):
     _factory = _sf()
     await init_telemetry(_factory)
 
-    async with _factory() as _sess:
-        _integrations = await _IR(_sess).list_all()
-    # Union DB-seeded engines with YAML-loaded engines so deployments that skip
-    # bootstrap (config.yaml only, no Helm) still report their engine types.
-    _engine_types = list(
-        {i.type for i in _integrations} | {c.type for c in settings.load_engines_config()}
-    )
+    if maxun_only:
+        # The Maxun profile deliberately does not initialize or enumerate the
+        # general connector registry. Its only query engine is request-scoped
+        # and workspace-bound.
+        _engine_types = ["maxun"]
+    else:
+        async with _factory() as _sess:
+            _integrations = await _IR(_sess).list_all()
+        # Union DB-seeded engines with YAML-loaded engines so deployments that
+        # skip bootstrap (config.yaml only, no Helm) still report their engine
+        # types.
+        _engine_types = list(
+            {i.type for i in _integrations} | {c.type for c in settings.load_engines_config()}
+        )
 
     _tracer = _otrace.get_tracer("analytics_agent")
     with _tracer.start_as_current_span("agent.started") as _span:
@@ -169,10 +180,12 @@ async def lifespan(app: FastAPI):
         _span.set_attribute("engines.count", len(_engine_types))
         _span.set_attribute("prompt_cache.enabled", settings.enable_prompt_cache)
 
-    # Background MCP tool discovery — non-blocking, per-platform retry.
-    import asyncio as _asyncio
+    # Background MCP tool discovery is part of the general app only. The
+    # Maxun profile must not initialize caller-configurable context platforms.
+    if not maxun_only:
+        import asyncio as _asyncio
 
-    _asyncio.create_task(_discover_mcp_tools_on_boot())
+        _asyncio.create_task(_discover_mcp_tools_on_boot())
 
     yield
 
@@ -181,10 +194,12 @@ async def lifespan(app: FastAPI):
         with contextlib.suppress(asyncio.CancelledError):
             await materialization_cleanup_task
 
-    from analytics_agent.engines.factory import close_all
+    if not maxun_only:
+        from analytics_agent.engines.factory import close_all
+
+        await close_all()
     from analytics_agent.engines.maxun.engine import shutdown_query_capacity
 
-    await close_all()
     await asyncio.to_thread(shutdown_query_capacity)
 
 
@@ -411,8 +426,13 @@ async def _load_llm_config_from_db() -> None:
         os.environ["ENABLE_PROMPT_CACHE"] = "true" if flag_on else "false"
 
 
-def create_app() -> FastAPI:
+def create_app(profile: str | None = None) -> FastAPI:
     import os
+
+    selected_profile = profile or settings.analytics_agent_profile
+    if selected_profile not in {"general", "maxun"}:
+        raise ValueError("analytics agent profile must be 'general' or 'maxun'")
+    maxun_only = selected_profile == "maxun"
 
     from fastapi.responses import FileResponse
     from fastapi.staticfiles import StaticFiles
@@ -439,20 +459,31 @@ def create_app() -> FastAPI:
         title="DataHub Talk to Data",
         version=get_package_version(),
         lifespan=lifespan,
+        docs_url=None if maxun_only else "/docs",
+        redoc_url=None if maxun_only else "/redoc",
+        openapi_url=None if maxun_only else "/openapi.json",
     )
+    app.state.analytics_agent_profile = selected_profile
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://localhost:3000"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    if not maxun_only:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["http://localhost:5173", "http://localhost:3000"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
-    from analytics_agent.api import api_router
     from analytics_agent.tracing import setup_tracing
 
-    app.include_router(api_router)
+    if maxun_only:
+        from analytics_agent.api import maxun_api_router
+
+        app.include_router(maxun_api_router)
+    else:
+        from analytics_agent.api import api_router
+
+        app.include_router(api_router)
 
     @app.get("/health", include_in_schema=False)
     async def _health() -> dict[str, str]:
@@ -461,30 +492,35 @@ def create_app() -> FastAPI:
     setup_tracing(app)
 
     # ── Serve built React SPA ──────────────────────────────────────────────
-    # Only activates when frontend/dist/ exists (production / pnpm build).
-    # Falls back gracefully: serves API-only if dist is absent (dev mode).
-    _env_dist = os.getenv("FRONTEND_DIST", "")
-    if _env_dist:
-        _dist = Path(_env_dist)
-    elif (Path(__file__).parent / "static").exists():
-        _dist = Path(__file__).parent / "static"  # bundled in wheel
-    else:
-        _dist = Path(__file__).parents[3] / "frontend" / "dist"  # dev / repo
+    # The Maxun profile is API-only and must not expose the general Agent UI.
+    if not maxun_only:
+        # Only activates when frontend/dist/ exists (production / pnpm build).
+        # Falls back gracefully: serves API-only if dist is absent (dev mode).
+        _env_dist = os.getenv("FRONTEND_DIST", "")
+        if _env_dist:
+            _dist = Path(_env_dist)
+        elif (Path(__file__).parent / "static").exists():
+            _dist = Path(__file__).parent / "static"  # bundled in wheel
+        else:
+            _dist = Path(__file__).parents[3] / "frontend" / "dist"  # dev / repo
 
-    if _dist.exists():
-        logger.info("Serving frontend from %s", _dist)
+        if _dist.exists():
+            logger.info("Serving frontend from %s", _dist)
 
-        # Vite hashes asset filenames → safe to serve indefinitely
-        app.mount("/assets", StaticFiles(directory=_dist / "assets"), name="spa-assets")
+            # Vite hashes asset filenames → safe to serve indefinitely
+            app.mount("/assets", StaticFiles(directory=_dist / "assets"), name="spa-assets")
 
-        @app.get("/{full_path:path}", include_in_schema=False)
-        async def _spa_fallback(full_path: str) -> FileResponse:
-            """Return index.html for all non-API routes (SPA client-side routing)."""
-            return FileResponse(_dist / "index.html", media_type="text/html")
-    else:
-        logger.info("Frontend dist not found at %s — running in API-only mode", _dist)
+            @app.get("/{full_path:path}", include_in_schema=False)
+            async def _spa_fallback(full_path: str) -> FileResponse:
+                """Return index.html for all non-API routes."""
+                return FileResponse(_dist / "index.html", media_type="text/html")
+        else:
+            logger.info("Frontend dist not found at %s — running in API-only mode", _dist)
 
     return app
 
 
 app = create_app()
+# The Maxun deployment targets this explicit object instead of the general
+# `app`, so a missing profile environment variable cannot widen its route set.
+maxun_app = create_app("maxun")

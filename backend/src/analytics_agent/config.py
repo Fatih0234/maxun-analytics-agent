@@ -265,6 +265,9 @@ class Settings(BaseSettings):
 
     # App
     log_level: str = "INFO"
+    # The Maxun deployment selects a separate narrow application surface. The
+    # default remains the general app for the unrelated quickstart product.
+    analytics_agent_profile: Literal["general", "maxun"] = "general"
     sse_keepalive_interval: int = 15
     # Total wall-clock envelope for one Maxun turn, including provider wait.
     # Maxun remains the public authority; this Agent limit releases local
