@@ -157,6 +157,40 @@ def test_workspace_symlink_cannot_escape_controlled_root(workspace: Path, tmp_pa
     artifact.unlink(missing_ok=True)
 
 
+def test_engine_rejects_workspace_replacement_during_descriptor_open(
+    workspace: Path, tmp_path: Path, monkeypatch
+):
+    Materializer(workspace).materialize(MaterializationRequest.model_validate(request_body()))
+    workspace_dir = workspace / "v1" / IDS["workspace"]
+    backup = workspace / "v1" / f"{IDS['workspace']}.engine-original"
+    outside = tmp_path / "engine-outside"
+    outside.mkdir(mode=0o700)
+    original_open = engine_module.os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == IDS["workspace"] and not swapped:
+            workspace_dir.rename(backup)
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(engine_module.os, "open", racing_open)
+    try:
+        with pytest.raises(MaxunQueryError):
+            MaxunWorkspaceEngine(IDS["workspace"], root=workspace)
+        assert swapped
+        assert not list(outside.iterdir())
+    finally:
+        if workspace_dir.is_symlink():
+            workspace_dir.unlink()
+        if backup.exists():
+            backup.rename(workspace_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
 def test_invalid_namespace_and_manifest_fail_closed(workspace: Path):
     with pytest.raises(MaxunQueryError) as error:
         MaxunWorkspaceEngine("11111111-1111-4111-8111-111111111112", root=workspace)
