@@ -163,8 +163,6 @@ async def lifespan(app: FastAPI):
     # Maxun profile never initializes that generic surface.
     if not maxun_only:
         await _check_encryption_key_consistency()
-    else:
-        _validate_maxun_llm_egress()
 
     # Per-pod read-only init. All DB-mutating bootstrap work (migrations,
     # yaml→DB seeds, first-run defaults) is now done by the analytics-agent
@@ -173,6 +171,8 @@ async def lifespan(app: FastAPI):
         await register_engines_from_db()
         await propagate_datahub_env()
     await _load_llm_config_from_db()
+    if maxun_only:
+        _validate_maxun_llm_egress()
 
     # Derived Maxun workspaces are disposable cache entries. Cleanup is best
     # effort and never prevents the Analytics Agent from starting.
