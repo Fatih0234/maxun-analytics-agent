@@ -503,6 +503,16 @@ def test_failed_build_does_not_publish_partial_final_file(tmp_path: Path, monkey
     assert not list(workspace_dir.glob("workspace.tmp.*.duckdb"))
 
 
+def test_materialization_cancel_before_worker_registration_is_sticky(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert materializer.cancel_operation(IDS["workspace"], operation_id)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(request, operation_id=operation_id, deadline_at=time.time() + 30)
+    assert error.value.code == "MATERIALIZATION_CANCELLED"
+
+
 def test_materialization_deadline_fails_before_publish(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)

@@ -592,6 +592,7 @@ class Materializer:
         self._wait_seconds = wait_seconds
         self._semaphore = threading.BoundedSemaphore(concurrency)
         self._operations: dict[str, _MaterializationOperation] = {}
+        self._cancelled_operations: dict[str, float] = {}
         self._operations_lock = threading.Lock()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -613,6 +614,14 @@ class Materializer:
             )
         operation = _MaterializationOperation(canonical_operation, canonical_workspace, deadline_at)
         with self._operations_lock:
+            now = time.time()
+            self._cancelled_operations = {
+                key: expiry for key, expiry in self._cancelled_operations.items() if expiry > now
+            }
+            if canonical_operation in self._cancelled_operations:
+                raise MaterializationError(
+                    "MATERIALIZATION_CANCELLED", "materialization was cancelled", 409
+                )
             if canonical_operation in self._operations:
                 raise MaterializationError(
                     "MATERIALIZATION_BUSY", "materialization operation is already active", 409
@@ -634,8 +643,11 @@ class Materializer:
             )
         with self._operations_lock:
             operation = self._operations.get(canonical_operation)
-        if operation is None:
-            return True
+            if operation is None:
+                self._cancelled_operations[canonical_operation] = (
+                    time.time() + MAX_MATERIALIZATION_HARD_SECONDS
+                )
+                return True
         if operation.workspace_id != canonical_workspace:
             raise MaterializationError(
                 "MATERIALIZATION_INVALID_CONTRACT", "operation workspace mismatch", 409
