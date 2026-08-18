@@ -10,6 +10,13 @@ RUN cd frontend && pnpm build
 
 # ── Stage 2: Python runtime ───────────────────────────────────────────────────
 FROM python:3.12-slim
+
+# Keep the runtime image current with security fixes from the Debian base image.
+# The image is later executed as the unprivileged analytics-agent user.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 ARG MAXUN_ANALYTICS_BUILD_ARG_SHA=unknown
