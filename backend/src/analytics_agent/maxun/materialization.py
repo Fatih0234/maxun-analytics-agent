@@ -479,6 +479,7 @@ class _MaterializationOperation:
         )
         self.deadline_at = min(requested_deadline, now + MAX_MATERIALIZATION_HARD_SECONDS)
         self.cancelled = threading.Event()
+        self.expired = threading.Event()
         self.done = threading.Event()
         self._connection: duckdb.DuckDBPyConnection | None = None
         self._connection_lock = threading.Lock()
@@ -489,6 +490,7 @@ class _MaterializationOperation:
                 "MATERIALIZATION_CANCELLED", "materialization was cancelled", 409
             )
         if time.time() >= self.deadline_at:
+            self.expired.set()
             self.cancelled.set()
             self.interrupt()
             raise MaterializationError("MATERIALIZATION_TIMEOUT", "materialization timed out", 504)
@@ -882,6 +884,18 @@ class Materializer:
             )
             connection.execute("COMMIT")
             connection.execute("CHECKPOINT")
+        except Exception as error:
+            if operation is not None and operation.cancelled.is_set():
+                code = (
+                    "MATERIALIZATION_TIMEOUT"
+                    if operation.expired.is_set()
+                    else "MATERIALIZATION_CANCELLED"
+                )
+                status = 504 if code == "MATERIALIZATION_TIMEOUT" else 409
+                raise MaterializationError(
+                    code, "materialization did not complete", status
+                ) from error
+            raise
         finally:
             connection.close()
             if operation is not None:
