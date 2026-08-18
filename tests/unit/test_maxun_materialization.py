@@ -573,6 +573,7 @@ def test_materialization_cancellation_converges_before_publish(tmp_path: Path):
         while True:
             operation.check()
 
+    original_build = materializer._build
     materializer._build = blocked_build
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
@@ -588,6 +589,13 @@ def test_materialization_cancellation_converges_before_publish(tmp_path: Path):
             future.result(timeout=2)
     assert error.value.code == "MATERIALIZATION_CANCELLED"
     assert not (tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
+    materializer._build = original_build
+    rebuilt = materializer.materialize(
+        request,
+        operation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        deadline_at=time.time() + 30,
+    )
+    assert rebuilt["state"] == "ready"
 
 
 def test_materialization_capacity_returns_bounded_busy_error(tmp_path: Path):
