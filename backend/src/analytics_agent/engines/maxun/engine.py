@@ -16,7 +16,6 @@ import datetime as dt
 import decimal
 import logging
 import os
-import stat
 import threading
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,7 @@ from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import traverse_scope
 
 from analytics_agent.engines.base import QueryEngine
-from analytics_agent.maxun.materialization import Materializer
+from analytics_agent.maxun.materialization import MaterializationError, Materializer
 
 logger = logging.getLogger(__name__)
 
@@ -127,31 +126,17 @@ def _workspace_artifact_path(workspace_id: str, root: str | Path | None = None) 
 
     canonical = _canonical_workspace_id(workspace_id)
     materializer = Materializer(root)
-    root_path = materializer.root
-    version_path = root_path / "v1"
-    if root_path.is_symlink() or version_path.is_symlink():
-        raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace is unavailable")
-    base = version_path.resolve()
-    candidate = base / canonical
-    if candidate.is_symlink():
-        raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace is unavailable")
-    directory = candidate.resolve()
-    if directory.parent != base or directory.name != canonical:
-        raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace is unavailable")
-    artifact = directory / "workspace.duckdb"
-    if artifact.is_symlink() or not artifact.is_file():
-        raise MaxunQueryError("MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable")
     try:
-        if (
-            stat.S_IMODE(directory.stat().st_mode) & 0o077
-            or stat.S_IMODE(artifact.stat().st_mode) & 0o077
-        ):
-            raise MaxunQueryError("MAXUN_WORKSPACE_INTEGRITY", "Workspace data is unavailable")
-    except OSError as error:
-        raise MaxunQueryError(
-            "MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable"
-        ) from error
-    return artifact
+        return materializer.artifact_path(canonical)
+    except MaterializationError as error:
+        code = (
+            "MAXUN_WORKSPACE_INTEGRITY"
+            if error.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+            else "MAXUN_WORKSPACE_INVALID"
+            if error.code == "MATERIALIZATION_INVALID_CONTRACT"
+            else "MAXUN_WORKSPACE_UNAVAILABLE"
+        )
+        raise MaxunQueryError(code, "Workspace data is unavailable") from error
 
 
 def _configure_read_only(connection: duckdb.DuckDBPyConnection) -> None:

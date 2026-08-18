@@ -455,6 +455,41 @@ def test_digest_matches_cross_runtime_golden_vector():
     )
 
 
+def test_materialization_rejects_symlinked_workspace_directory(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(MaterializationRequest.model_validate(payload()))
+    assert error.value.code == "MATERIALIZATION_INVALID_CONTRACT"
+    assert not (outside / "workspace.duckdb").exists()
+
+
+def test_materialization_rejects_symlinked_lock_path(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    outside = tmp_path / "outside.lock"
+    outside.write_bytes(b"must remain")
+    lock_path = tmp_path / "v1" / ".locks" / f"{IDS['workspace']}.lock"
+    lock_path.symlink_to(outside)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(MaterializationRequest.model_validate(payload()))
+    assert error.value.code == "MATERIALIZATION_INVALID_CONTRACT"
+    assert outside.read_bytes() == b"must remain"
+
+
+def test_materialization_fails_closed_on_root_permission_drift(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    os.chmod(tmp_path, 0o755)
+    try:
+        with pytest.raises(MaterializationError) as error:
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+    finally:
+        os.chmod(tmp_path, 0o700)
+
+
 def test_untrusted_metadata_cannot_change_materialization_path(tmp_path: Path):
     body = payload()
     body["sources"][0]["sourceDatasetKey"] = "../../outside"
@@ -626,6 +661,18 @@ def test_stable_lock_blocks_rebuild_after_delete_removes_directory(tmp_path: Pat
     assert started.is_set()
 
 
+def test_delete_fails_closed_on_symlinked_workspace(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(MaterializationError) as error:
+        materializer.delete(IDS["workspace"])
+    assert error.value.code == "MATERIALIZATION_INVALID_CONTRACT"
+    assert outside.exists()
+
+
 def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
@@ -639,7 +686,8 @@ def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
 def test_ttl_cleanup_removes_stale_final_less_temp_files(tmp_path: Path):
     materializer = Materializer(tmp_path)
     directory = tmp_path / "v1" / IDS["workspace"]
-    directory.mkdir()
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
     temp = directory / "workspace.tmp.crashed.duckdb.wal"
     temp.write_bytes(b"orphan")
     os.utime(temp, (100, 100))
@@ -650,7 +698,8 @@ def test_ttl_cleanup_removes_stale_final_less_temp_files(tmp_path: Path):
 def test_ttl_cleanup_keeps_fresh_final_less_temp_files(tmp_path: Path):
     materializer = Materializer(tmp_path)
     directory = tmp_path / "v1" / IDS["workspace"]
-    directory.mkdir()
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
     temp = directory / "workspace.tmp.active.duckdb"
     temp.write_bytes(b"active")
     os.utime(temp, (105, 105))

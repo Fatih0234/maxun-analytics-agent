@@ -6,7 +6,7 @@ import math
 import os
 import re
 import secrets
-import shutil
+import stat
 import threading
 import time
 from collections.abc import Iterator
@@ -469,6 +469,83 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+def _ensure_directory(path: Path, *, parents: bool = False) -> None:
+    try:
+        path.mkdir(mode=0o700, parents=parents, exist_ok=True)
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
+        ) from error
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH", "materialization storage is unavailable", 503
+        )
+    try:
+        os.chmod(path, 0o700, follow_symlinks=False)
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
+        ) from error
+
+
+def _validate_directory(path: Path, *, allow_missing: bool = False) -> bool:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        if allow_missing:
+            return False
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
+        )
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise MaterializationError(
+            "MATERIALIZATION_INVALID_CONTRACT", "materialization storage path is invalid", 503
+        )
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization storage permissions are unsafe",
+            503,
+        )
+    return True
+
+
+def _validate_regular_file(path: Path, *, allow_missing: bool = False) -> bool:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        if allow_missing:
+            return False
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization artifact is unavailable", 503
+        )
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization artifact is unavailable", 503
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise MaterializationError(
+            "MATERIALIZATION_INVALID_CONTRACT", "materialization artifact path is invalid", 503
+        )
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization artifact permissions are unsafe",
+            503,
+        )
+    return True
+
+
 class _MaterializationOperation:
     def __init__(self, operation_id: str, workspace_id: str, deadline_at: float | None):
         self.operation_id = operation_id
@@ -522,11 +599,28 @@ class _MaterializationOperation:
 def _lock(path: Path, operation: _MaterializationOperation | None = None) -> Iterator[None]:
     import fcntl
 
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
-    path.touch(mode=0o600, exist_ok=True)
-    path.chmod(0o600)
-    with path.open("r+") as handle:
+    _validate_directory(path.parent)
+    try:
+        fd = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH", "materialization lock is unavailable", 503
+        ) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH", "materialization lock is unavailable", 503
+            )
+        os.fchmod(fd, 0o600)
+    except Exception:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "r+") as handle:
         while True:
             if operation is not None:
                 operation.check()
@@ -567,6 +661,43 @@ def _manifest(connection: duckdb.DuckDBPyConnection) -> dict[str, Any] | None:
     return dict(zip(columns, row))
 
 
+def _remove_tree_no_follow(path: Path) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization cleanup is unavailable", 503
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise MaterializationError(
+            "MATERIALIZATION_INVALID_CONTRACT", "materialization cleanup path is invalid", 503
+        )
+    try:
+        entries = list(os.scandir(path))
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization cleanup is unavailable", 503
+        ) from error
+    for entry in entries:
+        entry_path = Path(entry.path)
+        entry_info = entry.stat(follow_symlinks=False)
+        if stat.S_ISLNK(entry_info.st_mode):
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH", "materialization cleanup path is unsafe", 503
+            )
+        if stat.S_ISDIR(entry_info.st_mode):
+            _remove_tree_no_follow(entry_path)
+        elif stat.S_ISREG(entry_info.st_mode):
+            entry_path.unlink()
+        else:
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH", "materialization cleanup path is unsafe", 503
+            )
+    path.rmdir()
+
+
 class Materializer:
     def __init__(self, root: str | Path | None = None):
         configured_root = os.environ.get("MAXUN_MATERIALIZATION_ROOT", "").strip()
@@ -594,11 +725,11 @@ class Materializer:
         self._operations: dict[str, _MaterializationOperation] = {}
         self._cancelled_operations: dict[str, float] = {}
         self._operations_lock = threading.Lock()
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.root.chmod(0o700)
-        (self.root / "v1" / ".locks").mkdir(mode=0o700, parents=True, exist_ok=True)
-        (self.root / "v1").chmod(0o700)
-        (self.root / "v1" / ".locks").chmod(0o700)
+        _ensure_directory(self.root, parents=True)
+        version = self.root / "v1"
+        locks = version / ".locks"
+        _ensure_directory(version)
+        _ensure_directory(locks)
 
     def _begin_operation(
         self,
@@ -683,8 +814,15 @@ class Materializer:
 
     def _paths(self, workspace_id: str) -> tuple[Path, Path, Path]:
         workspace = str(_uuid(workspace_id))
-        directory = self.root / "v1" / workspace
-        lock_path = self.root / "v1" / ".locks" / f"{workspace}.lock"
+        version = self.root / "v1"
+        locks = version / ".locks"
+        _validate_directory(self.root)
+        _validate_directory(version)
+        _validate_directory(locks)
+        directory = version / workspace
+        lock_path = locks / f"{workspace}.lock"
+        _validate_directory(directory, allow_missing=True)
+        _validate_regular_file(lock_path, allow_missing=True)
         return directory, directory / "workspace.duckdb", lock_path
 
     def materialize(
@@ -705,8 +843,8 @@ class Materializer:
             directory, final, lock_path = self._paths(request.workspace.id)
             with self._capacity(operation), _lock(lock_path, operation):
                 operation.check()
-                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-                directory.chmod(0o700)
+                _ensure_directory(directory)
+                _validate_regular_file(final, allow_missing=True)
                 if final.exists():
                     try:
                         with duckdb.connect(str(final), read_only=True) as existing:
@@ -734,8 +872,10 @@ class Materializer:
                 temp = directory / f"workspace.tmp.{secrets.token_hex(12)}.duckdb"
                 try:
                     response = self._build(request, digest, temp, operation)
+                    _validate_regular_file(temp)
                     operation.check()
                     os.replace(temp, final)
+                    _validate_regular_file(final)
                     return response
                 except Exception:
                     temp.unlink(missing_ok=True)
@@ -956,16 +1096,18 @@ class Materializer:
             "schema": schema,
         }
 
+    def artifact_path(self, workspace_id: str) -> Path:
+        directory, final, _ = self._paths(workspace_id)
+        _validate_directory(directory)
+        _validate_regular_file(final)
+        return final
+
     def delete(self, workspace_id: str) -> None:
         directory, _, lock_path = self._paths(workspace_id)
         with _lock(lock_path):
-            if not directory.exists():
+            if not _validate_directory(directory, allow_missing=True):
                 return
-            if directory.resolve().parent != (self.root / "v1").resolve():
-                raise MaterializationError(
-                    "MATERIALIZATION_INVALID_CONTRACT", "invalid materialization path"
-                )
-            shutil.rmtree(directory)
+            _remove_tree_no_follow(directory)
 
     @staticmethod
     def _is_known_artifact(path: Path) -> bool:
@@ -980,45 +1122,66 @@ class Materializer:
         if ttl_seconds < 1:
             raise ValueError("ttl_seconds must be positive")
         base = self.root / "v1"
-        if not base.exists():
+        if not _validate_directory(base, allow_missing=True):
             return 0
         current = now if now is not None else time.time()
         cutoff = current - ttl_seconds
         removed = 0
-        for directory in base.iterdir():
-            if not directory.is_dir() or directory.is_symlink():
-                continue
+        try:
+            entries = list(os.scandir(base))
+        except OSError:
+            return 0
+        for entry in entries:
             try:
-                workspace_id = str(UUID(directory.name))
-                if directory.resolve().parent != base.resolve():
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                     continue
-                _, final, lock_path = self._paths(workspace_id)
+                workspace_id = str(UUID(entry.name))
+                if workspace_id != entry.name:
+                    continue
+                directory, final, lock_path = self._paths(workspace_id)
                 with _lock(lock_path):
-                    entries = list(directory.iterdir())
-                    if final.exists() and final.stat().st_mtime <= cutoff:
-                        shutil.rmtree(directory)
-                        removed += 1
-                        continue
-                    for artifact in entries:
+                    _validate_directory(directory)
+                    final_exists = _validate_regular_file(final, allow_missing=True)
+                    if final_exists:
+                        final_info = os.lstat(final)
+                        if final_info.st_mtime <= cutoff:
+                            _remove_tree_no_follow(directory)
+                            removed += 1
+                            continue
+                    directory_entries = list(os.scandir(directory))
+                    for artifact_entry in directory_entries:
+                        artifact = Path(artifact_entry.path)
+                        artifact_info = artifact_entry.stat(follow_symlinks=False)
+                        if stat.S_ISLNK(artifact_info.st_mode):
+                            raise MaterializationError(
+                                "MATERIALIZATION_INTEGRITY_MISMATCH",
+                                "materialization cleanup path is unsafe",
+                                503,
+                            )
                         if (
-                            artifact.is_file()
+                            stat.S_ISREG(artifact_info.st_mode)
                             and self._is_known_artifact(artifact)
-                            and artifact.stat().st_mtime <= cutoff
+                            and artifact_info.st_mtime <= cutoff
                         ):
-                            artifact.unlink(missing_ok=True)
-                    remaining = [entry for entry in directory.iterdir()]
+                            artifact.unlink()
+                    remaining_entries = list(os.scandir(directory))
+                    remaining = [Path(item.path) for item in remaining_entries]
+                    final_exists = _validate_regular_file(final, allow_missing=True)
                     if (
-                        not final.exists()
+                        not final_exists
                         and remaining
-                        and all(self._is_known_artifact(entry) for entry in remaining)
-                        and all(entry.stat().st_mtime <= cutoff for entry in remaining)
+                        and all(self._is_known_artifact(item) for item in remaining)
+                        and all(os.lstat(item).st_mtime <= cutoff for item in remaining)
                     ):
-                        shutil.rmtree(directory)
+                        _remove_tree_no_follow(directory)
                         removed += 1
-                    elif not final.exists() and not remaining:
+                    elif not final_exists and not remaining:
                         directory.rmdir()
                         removed += 1
-            except (OSError, ValueError):
+            except (OSError, ValueError, MaterializationError):
+                # Hostile or concurrently changing state is fail-closed: leave
+                # it for a later cleanup pass rather than following/deleting it.
                 continue
         return removed
 
