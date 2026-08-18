@@ -9,13 +9,13 @@ COPY frontend ./frontend
 RUN cd frontend && pnpm build
 
 # ── Stage 2: Python runtime ───────────────────────────────────────────────────
-FROM python:3.12-slim
+FROM python:3.12-alpine
 
-# Keep the runtime image current with security fixes from the Debian base image.
+# Keep the runtime image current with security fixes from the Alpine base image.
 # The image is later executed as the unprivileged analytics-agent user.
-RUN apt-get update \
-    && apt-get upgrade -y --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+# Runtime C++/RE2 libraries are required by DuckDB and google-re2 wheels.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache libstdc++ libgcc re2
 
 WORKDIR /app
 
@@ -30,7 +30,9 @@ RUN pip install uv
 COPY pyproject.toml uv.lock README.md hatch_build.py ./
 COPY backend/ backend/
 
-RUN uv sync --no-dev
+RUN apk add --no-cache g++ re2-dev py3-pybind11-dev \
+    && uv sync --no-dev \
+    && apk del g++ re2-dev py3-pybind11-dev
 # Add venv and uv tool bin dirs to PATH.
 # uv tool install puts binaries in ~/.local/bin (i.e. /root/.local/bin for root).
 ENV PATH="/app/.venv/bin:/root/.local/bin:$PATH"
@@ -62,8 +64,8 @@ COPY --from=fe-build /app/frontend/dist ./frontend/dist
 # The Maxun deployment runs the image without root. Named volumes are
 # initialized from these service-owned directories and remain writable by the
 # runtime UID; the root filesystem itself is made read-only by deployment.
-RUN groupadd --system --gid 10001 analytics-agent \
-    && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/analytics-agent analytics-agent \
+RUN addgroup -S -g 10001 analytics-agent \
+    && adduser -S -D -u 10001 -G analytics-agent -h /home/analytics-agent analytics-agent \
     && mkdir -p /var/lib/maxun-analytics/materializations /var/lib/maxun-analytics/config \
     && chown -R analytics-agent:analytics-agent /var/lib/maxun-analytics /home/analytics-agent
 ENV HOME=/home/analytics-agent \
