@@ -33,17 +33,19 @@ def test_maxun_profile_mounts_only_health_and_internal_routes():
     assert not any("full_path" in path for path in paths)
 
 
-def test_maxun_profile_hides_generic_http_routes_and_keeps_internal_auth():
+async def test_maxun_profile_hides_generic_http_routes_and_keeps_internal_auth():
+    import httpx
     from analytics_agent.main import create_app
-    from fastapi.testclient import TestClient
 
-    client = TestClient(create_app("maxun"))
-    assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/api/settings/connections").status_code == 404
-    assert client.get("/api/version").status_code == 404
-    assert client.get("/docs").status_code == 404
-    assert (
-        client.post(
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app("maxun")),
+        base_url="http://test",
+    ) as client:
+        assert (await client.get("/health")).json() == {"status": "ok"}
+        assert (await client.get("/api/settings/connections")).status_code == 404
+        assert (await client.get("/api/version")).status_code == 404
+        assert (await client.get("/docs")).status_code == 404
+        response = await client.post(
             "/internal/maxun/conversations",
             json={
                 "workspace_id": "11111111-1111-4111-8111-111111111111",
@@ -51,9 +53,8 @@ def test_maxun_profile_hides_generic_http_routes_and_keeps_internal_auth():
                 "data_signature": "a" * 64,
                 "title": "test",
             },
-        ).status_code
-        == 503
-    )
+        )
+        assert response.status_code == 503
 
 
 def test_general_profile_retains_the_existing_application_surface():
