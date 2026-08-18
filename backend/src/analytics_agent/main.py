@@ -6,6 +6,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -55,6 +56,54 @@ async def register_engines_from_db() -> None:
             register_engine(intg.name, intg.type, conn_cfg)
         except Exception as e:
             logger.warning("Failed to register engine %s: %s", intg.name, e)
+
+
+_DEFAULT_MAXUN_LLM_HOSTS = frozenset(
+    {
+        "api.openai.com",
+        "api.anthropic.com",
+        "generativelanguage.googleapis.com",
+    }
+)
+
+
+def _maxun_allowed_llm_hosts() -> set[str]:
+    configured = os.environ.get("MAXUN_LLM_ALLOWED_HOSTS", "")
+    return {
+        host.strip().casefold().rstrip(".") for host in configured.split(",") if host.strip()
+    } | set(_DEFAULT_MAXUN_LLM_HOSTS)
+
+
+def _validate_maxun_llm_egress() -> None:
+    """Reject arbitrary custom LLM destinations in the Maxun profile.
+
+    Network policy must still enforce the allowlist. This startup check prevents
+    a caller-controlled/configured URL from silently becoming an unrestricted
+    egress tunnel when the deployment forgets to configure its proxy/firewall.
+    """
+
+    allowed_hosts = _maxun_allowed_llm_hosts()
+    approved_proxy = os.environ.get("MAXUN_APPROVED_LLM_PROXY_URL", "").strip().rstrip("/")
+    candidate_urls = {
+        "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL", "").strip(),
+        "OPENAI_COMPATIBLE_BASE_URL": (
+            os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "").strip()
+            or os.environ.get("OPENAI_COMPAT_BASE_URL", "").strip()
+            or settings.openai_compatible_base_url.strip()
+        ),
+        "ANTHROPIC_BASE_URL": (
+            os.environ.get("ANTHROPIC_BASE_URL", "").strip() or settings.anthropic_base_url.strip()
+        ),
+    }
+    for variable, raw_url in candidate_urls.items():
+        if not raw_url:
+            continue
+        parsed = urlparse(raw_url)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        if parsed.scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+            raise RuntimeError(f"{variable} is invalid in the Maxun profile")
+        if host not in allowed_hosts and raw_url.rstrip("/") != approved_proxy:
+            raise RuntimeError(f"{variable} is not allowlisted in the Maxun profile")
 
 
 async def _materialization_cleanup_loop(
@@ -114,6 +163,8 @@ async def lifespan(app: FastAPI):
     # Maxun profile never initializes that generic surface.
     if not maxun_only:
         await _check_encryption_key_consistency()
+    else:
+        _validate_maxun_llm_egress()
 
     # Per-pod read-only init. All DB-mutating bootstrap work (migrations,
     # yaml→DB seeds, first-run defaults) is now done by the analytics-agent

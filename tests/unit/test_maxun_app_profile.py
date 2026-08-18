@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -68,6 +70,39 @@ def test_general_profile_retains_the_existing_application_surface():
     assert "/api/version" in paths
     assert "/internal/maxun/conversations" in paths
     assert "/internal/maxun/materializations/{workspace_id}" in paths
+
+
+def test_maxun_image_declares_a_non_root_runtime():
+    dockerfile = (Path(__file__).parents[2] / "docker" / "Dockerfile").read_text()
+    assert "useradd --system --uid 10001" in dockerfile
+    assert "USER analytics-agent" in dockerfile
+
+
+def test_maxun_profile_rejects_unallowlisted_llm_destinations(monkeypatch):
+    from analytics_agent.main import _validate_maxun_llm_egress
+
+    monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "https://evil.example/v1")
+    with pytest.raises(RuntimeError, match="not allowlisted"):
+        _validate_maxun_llm_egress()
+
+
+def test_maxun_profile_accepts_provider_defaults_and_explicit_proxy(monkeypatch):
+    from analytics_agent.main import _validate_maxun_llm_egress
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    _validate_maxun_llm_egress()
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://llm-proxy:8080/v1")
+    monkeypatch.setenv("MAXUN_APPROVED_LLM_PROXY_URL", "http://llm-proxy:8080/v1")
+    _validate_maxun_llm_egress()
+
+
+def test_maxun_profile_rejects_embedded_llm_url_credentials(monkeypatch):
+    from analytics_agent.main import _validate_maxun_llm_egress
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://user:secret@api.openai.com/v1")
+    with pytest.raises(RuntimeError, match="invalid"):
+        _validate_maxun_llm_egress()
 
 
 def test_unknown_application_profile_fails_closed():

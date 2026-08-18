@@ -52,6 +52,17 @@ RUN cp config.yaml.example config.yaml
 # Copy built SPA — FastAPI serves it via static files + SPA fallback
 COPY --from=fe-build /app/frontend/dist ./frontend/dist
 
+# The Maxun deployment runs the image without root. Named volumes are
+# initialized from these service-owned directories and remain writable by the
+# runtime UID; the root filesystem itself is made read-only by deployment.
+RUN groupadd --system --gid 10001 analytics-agent \
+    && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/analytics-agent analytics-agent \
+    && mkdir -p /var/lib/maxun-analytics/materializations /var/lib/maxun-analytics/config \
+    && chown -R analytics-agent:analytics-agent /var/lib/maxun-analytics /home/analytics-agent
+ENV HOME=/home/analytics-agent \
+    PATH="/app/.venv/bin:/home/analytics-agent/.local/bin:/root/.local/bin:$PATH"
+USER analytics-agent
+
 EXPOSE 8100
 
 CMD ["sh", "-c", "analytics-agent bootstrap && uvicorn analytics_agent.main:app --host 0.0.0.0 --port 8100"]
