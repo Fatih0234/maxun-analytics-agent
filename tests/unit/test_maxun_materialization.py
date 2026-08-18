@@ -513,6 +513,174 @@ def test_materialization_fails_closed_on_root_permission_drift(tmp_path: Path):
         os.chmod(tmp_path, 0o700)
 
 
+def test_descriptor_anchor_rejects_lock_directory_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    locks_dir = tmp_path / "v1" / ".locks"
+    backup = tmp_path / "v1" / ".locks.original"
+    outside = tmp_path.parent / f"{tmp_path.name}-locks-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == ".locks" and not swapped:
+            locks_dir.rename(backup)
+            locks_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not list(outside.iterdir())
+    finally:
+        if locks_dir.is_symlink():
+            locks_dir.unlink()
+        if backup.exists():
+            backup.rename(locks_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_descriptor_anchor_rejects_workspace_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.mkdir(mode=0o700)
+    os.chmod(workspace_dir, 0o700)
+    outside = tmp_path.parent / f"{tmp_path.name}-workspace-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == IDS["workspace"] and not swapped:
+            workspace_dir.rmdir()
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not (outside / "workspace.duckdb").exists()
+    finally:
+        if workspace_dir.is_symlink():
+            workspace_dir.unlink()
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_descriptor_anchor_rejects_version_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    version_dir = tmp_path / "v1"
+    backup = tmp_path / "v1.original"
+    outside = tmp_path.parent / f"{tmp_path.name}-version-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == "v1" and not swapped:
+            version_dir.rename(backup)
+            version_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not (outside / IDS["workspace"] / "workspace.duckdb").exists()
+    finally:
+        if version_dir.is_symlink():
+            version_dir.unlink()
+        if backup.exists():
+            backup.rename(version_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_descriptor_anchor_rejects_root_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    backup = tmp_path.parent / f"{tmp_path.name}-root-original"
+    outside = tmp_path.parent / f"{tmp_path.name}-root-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is None and Path(path) == tmp_path and not swapped:
+            tmp_path.rename(backup)
+            tmp_path.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not (outside / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
+    finally:
+        if tmp_path.is_symlink():
+            tmp_path.unlink()
+        if backup.exists():
+            backup.rename(tmp_path)
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_materialization_rejects_final_replacement_after_descriptor_open(
+    tmp_path: Path, monkeypatch
+):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    final = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    backup = final.with_name("workspace.duckdb.original")
+    outside = tmp_path.parent / f"{tmp_path.name}-final-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_verify = materializer._verify_artifact_mac
+    swapped = False
+
+    def verify_then_swap(artifact, artifact_fd=None):
+        nonlocal swapped
+        original_verify(artifact, artifact_fd=artifact_fd)
+        if artifact_fd is not None and not swapped:
+            final.rename(backup)
+            final.symlink_to(outside / "outside.duckdb")
+            swapped = True
+
+    monkeypatch.setattr(materializer, "_verify_artifact_mac", verify_then_swap)
+    try:
+        with pytest.raises(MaterializationError) as error:
+            materializer.materialize(request)
+        assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+        assert swapped
+        assert not (outside / "outside.duckdb").exists()
+    finally:
+        if final.is_symlink():
+            final.unlink()
+        if backup.exists():
+            backup.rename(final)
+        if outside.exists():
+            outside.rmdir()
+
+
 def test_untrusted_metadata_cannot_change_materialization_path(tmp_path: Path):
     body = payload()
     body["sources"][0]["sourceDatasetKey"] = "../../outside"

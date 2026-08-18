@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import math
@@ -520,6 +521,146 @@ def _validate_directory(path: Path, *, allow_missing: bool = False) -> bool:
     return True
 
 
+def _open_regular_fd(
+    path: Path,
+    *,
+    allow_missing: bool = False,
+    normalize_permissions: bool = False,
+) -> int | None:
+    try:
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization artifact is unavailable", 503
+        )
+    except OSError as error:
+        code = (
+            "MATERIALIZATION_INVALID_CONTRACT"
+            if error.errno == errno.ELOOP
+            else "MATERIALIZATION_UNAVAILABLE"
+        )
+        raise MaterializationError(code, "materialization artifact is unavailable", 503) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise MaterializationError(
+                "MATERIALIZATION_INVALID_CONTRACT",
+                "materialization artifact path is invalid",
+                503,
+            )
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            if not normalize_permissions:
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "materialization artifact permissions are unsafe",
+                    503,
+                )
+            os.fchmod(fd, 0o600)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _assert_path_binding(path: Path, fd: int) -> None:
+    try:
+        path_info = os.lstat(path)
+        fd_info = os.fstat(fd)
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization artifact identity changed",
+            503,
+        ) from error
+    if not stat.S_ISREG(path_info.st_mode) or (path_info.st_dev, path_info.st_ino) != (
+        fd_info.st_dev,
+        fd_info.st_ino,
+    ):
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization artifact identity changed",
+            503,
+        )
+
+
+def _hmac_fd(fd: int, key: bytes) -> str:
+    digest = hmac.new(key, digestmod=hashlib.sha256)
+    offset = 0
+    while True:
+        chunk = os.pread(fd, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+@contextmanager
+def _read_only_connection(fd: int) -> Iterator[duckdb.DuckDBPyConnection]:
+    connection = duckdb.connect(f"/proc/self/fd/{fd}", read_only=True)
+    with connection:
+        yield connection
+
+
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+@contextmanager
+def _anchored_directory(
+    path: Path,
+    *,
+    parent_fd: int | None = None,
+    name: str | None = None,
+    create: bool = False,
+) -> Iterator[tuple[int, Path]]:
+    """Open a service-owned directory and expose a stable proc-fd anchor.
+
+    Path validation is still performed for the public path contract, but all
+    materialization writes happen through directory descriptors. This prevents
+    a sibling volume writer from swapping a validated workspace/version/root
+    directory for a symlink before DuckDB or ``os.replace`` opens it.
+    """
+
+    target = path if parent_fd is None else name
+    if target is None:
+        raise ValueError("directory name is required with parent_fd")
+    if create and parent_fd is not None:
+        try:
+            os.mkdir(target, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise MaterializationError(
+                "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
+            ) from error
+    try:
+        fd = os.open(target, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization storage path is unavailable",
+            503,
+        ) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH",
+                "materialization storage permissions are unsafe",
+                503,
+            )
+        yield fd, Path(f"/proc/self/fd/{fd}")
+    finally:
+        os.close(fd)
+
+
 def _validate_regular_file(path: Path, *, allow_missing: bool = False) -> bool:
     try:
         info = os.lstat(path)
@@ -596,15 +737,27 @@ class _MaterializationOperation:
 
 
 @contextmanager
-def _lock(path: Path, operation: _MaterializationOperation | None = None) -> Iterator[None]:
+def _lock(
+    path: Path,
+    operation: _MaterializationOperation | None = None,
+    *,
+    directory_fd: int | None = None,
+) -> Iterator[None]:
     import fcntl
 
-    _validate_directory(path.parent)
+    if directory_fd is None:
+        _validate_directory(path.parent)
+        lock_target: str | Path = path
+        lock_dir_fd = None
+    else:
+        lock_target = path.name
+        lock_dir_fd = directory_fd
     try:
         fd = os.open(
-            path,
+            lock_target,
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
             0o600,
+            dir_fd=lock_dir_fd,
         )
     except OSError as error:
         raise MaterializationError(
@@ -824,39 +977,69 @@ class Materializer:
     def _artifact_mac_path(self, artifact: Path) -> Path:
         return artifact.with_name(f"{artifact.name}.mac")
 
-    def _artifact_mac(self, artifact: Path) -> str:
+    def _artifact_mac(self, artifact: Path, artifact_fd: int | None = None) -> str:
         if self._artifact_mac_key is None:
             raise MaterializationError(
                 "MATERIALIZATION_INTEGRITY_MISMATCH", "artifact integrity is unavailable", 503
             )
-        digest = hmac.new(self._artifact_mac_key, digestmod=hashlib.sha256)
-        with artifact.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+        owned_fd = artifact_fd is None
+        fd = _open_regular_fd(artifact) if owned_fd else artifact_fd
+        assert fd is not None
+        try:
+            return _hmac_fd(fd, self._artifact_mac_key)
+        finally:
+            if owned_fd:
+                os.close(fd)
 
     def _write_artifact_mac(self, artifact: Path, mac_path: Path) -> None:
         expected = self._artifact_mac(artifact)
-        with mac_path.open("x", encoding="ascii") as handle:
-            handle.write(expected)
-        mac_path.chmod(0o600)
-
-    def _verify_artifact_mac(self, artifact: Path) -> None:
-        if not self._require_artifact_mac:
-            return
-        mac_path = self._artifact_mac_path(artifact)
-        _validate_regular_file(mac_path)
         try:
-            stored = mac_path.read_text(encoding="ascii").strip()
-        except (OSError, UnicodeError) as error:
+            fd = os.open(
+                mac_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+        except OSError as error:
             raise MaterializationError(
                 "MATERIALIZATION_INTEGRITY_MISMATCH", "artifact integrity is unavailable", 503
             ) from error
-        expected = self._artifact_mac(artifact)
-        if not hmac.compare_digest(stored, expected):
-            raise MaterializationError(
-                "MATERIALIZATION_INTEGRITY_MISMATCH", "artifact integrity verification failed", 503
-            )
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as handle:
+                handle.write(expected)
+                os.fchmod(handle.fileno(), 0o600)
+        except Exception:
+            mac_path.unlink(missing_ok=True)
+            raise
+
+    def _verify_artifact_mac(self, artifact: Path, artifact_fd: int | None = None) -> None:
+        if not self._require_artifact_mac:
+            return
+        mac_path = self._artifact_mac_path(artifact)
+        mac_fd = _open_regular_fd(mac_path)
+        assert mac_fd is not None
+        owned_artifact_fd = artifact_fd is None
+        checked_artifact_fd = _open_regular_fd(artifact) if owned_artifact_fd else artifact_fd
+        assert checked_artifact_fd is not None
+        try:
+            try:
+                stored = os.pread(mac_fd, 4096, 0).decode("ascii").strip()
+            except (OSError, UnicodeError) as error:
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "artifact integrity is unavailable",
+                    503,
+                ) from error
+            expected = self._artifact_mac(artifact, checked_artifact_fd)
+            if not hmac.compare_digest(stored, expected):
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "artifact integrity verification failed",
+                    503,
+                )
+        finally:
+            os.close(mac_fd)
+            if owned_artifact_fd:
+                os.close(checked_artifact_fd)
 
     def _paths(self, workspace_id: str) -> tuple[Path, Path, Path]:
         workspace = str(_uuid(workspace_id))
@@ -886,54 +1069,81 @@ class Materializer:
         try:
             operation.check()
             digest = input_digest(request)
-            directory, final, lock_path = self._paths(request.workspace.id)
-            with self._capacity(operation), _lock(lock_path, operation):
-                operation.check()
-                _ensure_directory(directory)
-                _validate_regular_file(final, allow_missing=True)
-                if final.exists():
-                    self._verify_artifact_mac(final)
-                    try:
-                        with duckdb.connect(str(final), read_only=True) as existing:
-                            found = _manifest(existing)
-                            if found and found.get("input_digest") == digest:
-                                # A successful integrity-checked access is a lease
-                                # refresh for the disposable artifact. Cleanup is
-                                # serialized by this same workspace lock.
-                                operation.check()
-                                os.utime(final, None)
-                                return self._response(request, digest, found, existing)
-                            if (
-                                found
-                                and found.get("data_signature") == request.workspace.dataSignature
-                            ):
-                                raise MaterializationError(
-                                    "MATERIALIZATION_INTEGRITY_MISMATCH",
-                                    "materialization input changed",
-                                    409,
-                                )
-                    except MaterializationError:
-                        raise
-                    except Exception:
-                        final.unlink(missing_ok=True)
-                temp = directory / f"workspace.tmp.{secrets.token_hex(12)}.duckdb"
-                temp_mac = self._artifact_mac_path(temp)
-                try:
-                    response = self._build(request, digest, temp, operation)
-                    _validate_regular_file(temp)
-                    if self._require_artifact_mac:
-                        self._write_artifact_mac(temp, temp_mac)
-                    operation.check()
-                    os.replace(temp, final)
-                    if self._require_artifact_mac:
-                        os.replace(temp_mac, self._artifact_mac_path(final))
-                    _validate_regular_file(final)
-                    self._verify_artifact_mac(final)
-                    return response
-                except Exception:
-                    temp.unlink(missing_ok=True)
-                    temp_mac.unlink(missing_ok=True)
-                    raise
+            directory, _, _ = self._paths(request.workspace.id)
+            workspace_name = directory.name
+            with _anchored_directory(self.root) as (root_fd, _):  # noqa: SIM117
+                with _anchored_directory(self.root / "v1", parent_fd=root_fd, name="v1") as (
+                    version_fd,
+                    _,
+                ):
+                    with _anchored_directory(
+                        self.root / "v1" / ".locks",
+                        parent_fd=version_fd,
+                        name=".locks",
+                    ) as (locks_fd, locks):
+                        lock_path = locks / f"{workspace_name}.lock"
+                        with (
+                            self._capacity(operation),
+                            _lock(lock_path, operation, directory_fd=locks_fd),
+                        ):
+                            operation.check()
+                            with _anchored_directory(
+                                directory,
+                                parent_fd=version_fd,
+                                name=workspace_name,
+                                create=True,
+                            ) as (_, directory):
+                                final = directory / "workspace.duckdb"
+                                final_fd = _open_regular_fd(final, allow_missing=True)
+                                if final_fd is not None:
+                                    try:
+                                        self._verify_artifact_mac(final, artifact_fd=final_fd)
+                                        with _read_only_connection(final_fd) as existing:
+                                            found = _manifest(existing)
+                                            if found and found.get("input_digest") == digest:
+                                                # A successful integrity-checked access is a lease
+                                                # refresh for the disposable artifact. Cleanup is
+                                                # serialized by this same workspace lock.
+                                                operation.check()
+                                                _assert_path_binding(final, final_fd)
+                                                os.utime(f"/proc/self/fd/{final_fd}", None)
+                                                return self._response(
+                                                    request, digest, found, existing
+                                                )
+                                            if (
+                                                found
+                                                and found.get("data_signature")
+                                                == request.workspace.dataSignature
+                                            ):
+                                                raise MaterializationError(
+                                                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                                                    "materialization input changed",
+                                                    409,
+                                                )
+                                    except MaterializationError:
+                                        raise
+                                    except Exception:
+                                        final.unlink(missing_ok=True)
+                                    finally:
+                                        os.close(final_fd)
+                                temp = directory / f"workspace.tmp.{secrets.token_hex(12)}.duckdb"
+                                temp_mac = self._artifact_mac_path(temp)
+                                try:
+                                    response = self._build(request, digest, temp, operation)
+                                    _validate_regular_file(temp)
+                                    if self._require_artifact_mac:
+                                        self._write_artifact_mac(temp, temp_mac)
+                                    operation.check()
+                                    os.replace(temp, final)
+                                    if self._require_artifact_mac:
+                                        os.replace(temp_mac, self._artifact_mac_path(final))
+                                    _validate_regular_file(final)
+                                    self._verify_artifact_mac(final)
+                                    return response
+                                except Exception:
+                                    temp.unlink(missing_ok=True)
+                                    temp_mac.unlink(missing_ok=True)
+                                    raise
         finally:
             self._finish_operation(operation)
 
@@ -1109,16 +1319,22 @@ class Materializer:
                 operation.set_connection(None)
         if operation is not None:
             operation.check()
-        path.chmod(0o600)
-        with duckdb.connect(str(path), read_only=True) as check:
-            if operation is not None:
-                operation.check()
-            found = _manifest(check)
-            if not found or found.get("input_digest") != digest:
-                raise MaterializationError(
-                    "MATERIALIZATION_UNAVAILABLE", "materialization verification failed", 503
-                )
-            return self._response(request, digest, found, check)
+        check_fd = _open_regular_fd(path, normalize_permissions=True)
+        assert check_fd is not None
+        try:
+            os.fchmod(check_fd, 0o600)
+            with _read_only_connection(check_fd) as check:
+                if operation is not None:
+                    operation.check()
+                found = _manifest(check)
+                if not found or found.get("input_digest") != digest:
+                    raise MaterializationError(
+                        "MATERIALIZATION_UNAVAILABLE", "materialization verification failed", 503
+                    )
+                _assert_path_binding(path, check_fd)
+                return self._response(request, digest, found, check)
+        finally:
+            os.close(check_fd)
 
     def _response(
         self,
