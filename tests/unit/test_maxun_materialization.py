@@ -872,6 +872,41 @@ def test_delete_fails_closed_on_symlinked_workspace(tmp_path: Path):
     assert outside.exists()
 
 
+def test_delete_rejects_workspace_replacement_after_lock_acquisition(tmp_path: Path, monkeypatch):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    backup = tmp_path / "v1" / f"{IDS['workspace']}.original"
+    outside = tmp_path.parent / f"{tmp_path.name}-delete-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == IDS["workspace"] and not swapped:
+            workspace_dir.rename(backup)
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.delete(IDS["workspace"])
+        assert swapped
+        assert not list(outside.iterdir())
+    finally:
+        if workspace_dir.is_symlink():
+            workspace_dir.unlink()
+        if backup.exists():
+            backup.rename(workspace_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
 def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
@@ -880,6 +915,43 @@ def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
     os.utime(database, (100, 100))
     assert materializer.cleanup_expired(ttl_seconds=10, now=111) == 1
     assert not database.exists()
+
+
+def test_ttl_cleanup_rejects_workspace_replacement_after_lock_scan(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.mkdir(mode=0o700)
+    os.chmod(workspace_dir, 0o700)
+    temp = workspace_dir / "workspace.tmp.crashed.duckdb.wal"
+    temp.write_bytes(b"orphan")
+    os.utime(temp, (100, 100))
+    backup = tmp_path / "v1" / f"{IDS['workspace']}.cleanup-original"
+    outside = tmp_path.parent / f"{tmp_path.name}-cleanup-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == IDS["workspace"] and not swapped:
+            workspace_dir.rename(backup)
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        assert materializer.cleanup_expired(ttl_seconds=10, now=111) == 0
+        assert swapped
+        assert not list(outside.iterdir())
+    finally:
+        if workspace_dir.is_symlink():
+            workspace_dir.unlink()
+        if backup.exists():
+            backup.rename(workspace_dir)
+        if outside.exists():
+            outside.rmdir()
 
 
 def test_ttl_cleanup_removes_stale_final_less_temp_files(tmp_path: Path):

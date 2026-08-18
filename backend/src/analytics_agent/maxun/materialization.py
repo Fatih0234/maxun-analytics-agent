@@ -522,8 +522,9 @@ def _validate_directory(path: Path, *, allow_missing: bool = False) -> bool:
 
 
 def _open_regular_fd(
-    path: Path,
+    path: Path | str,
     *,
+    parent_fd: int | None = None,
     allow_missing: bool = False,
     normalize_permissions: bool = False,
 ) -> int | None:
@@ -531,6 +532,7 @@ def _open_regular_fd(
         fd = os.open(
             path,
             os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
         )
     except FileNotFoundError:
         if allow_missing:
@@ -565,6 +567,27 @@ def _open_regular_fd(
     except Exception:
         os.close(fd)
         raise
+
+
+def _assert_directory_binding(parent_fd: int, name: str, fd: int) -> None:
+    try:
+        path_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        fd_info = os.fstat(fd)
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization workspace identity changed",
+            503,
+        ) from error
+    if not stat.S_ISDIR(path_info.st_mode) or (path_info.st_dev, path_info.st_ino) != (
+        fd_info.st_dev,
+        fd_info.st_ino,
+    ):
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization workspace identity changed",
+            503,
+        )
 
 
 def _assert_path_binding(path: Path, fd: int) -> None:
@@ -612,6 +635,40 @@ _DIRECTORY_OPEN_FLAGS = (
 )
 
 
+def _open_directory_fd(
+    target: Path | str,
+    *,
+    parent_fd: int | None = None,
+    allow_missing: bool = False,
+) -> int | None:
+    try:
+        fd = os.open(target, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
+        )
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_INTEGRITY_MISMATCH",
+            "materialization storage path is unavailable",
+            503,
+        ) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH",
+                "materialization storage permissions are unsafe",
+                503,
+            )
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
 @contextmanager
 def _anchored_directory(
     path: Path,
@@ -640,22 +697,9 @@ def _anchored_directory(
             raise MaterializationError(
                 "MATERIALIZATION_UNAVAILABLE", "materialization storage is unavailable", 503
             ) from error
+    fd = _open_directory_fd(target, parent_fd=parent_fd)
+    assert fd is not None
     try:
-        fd = os.open(target, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
-    except OSError as error:
-        raise MaterializationError(
-            "MATERIALIZATION_INTEGRITY_MISMATCH",
-            "materialization storage path is unavailable",
-            503,
-        ) from error
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
-            raise MaterializationError(
-                "MATERIALIZATION_INTEGRITY_MISMATCH",
-                "materialization storage permissions are unsafe",
-                503,
-            )
         yield fd, Path(f"/proc/self/fd/{fd}")
     finally:
         os.close(fd)
@@ -812,6 +856,49 @@ def _manifest(connection: duckdb.DuckDBPyConnection) -> dict[str, Any] | None:
         return None
     columns = [item[0] for item in connection.description]
     return dict(zip(columns, row))
+
+
+def _remove_tree_fd(fd: int) -> None:
+    try:
+        with os.scandir(fd) as iterator:
+            entries = list(iterator)
+    except OSError as error:
+        raise MaterializationError(
+            "MATERIALIZATION_UNAVAILABLE", "materialization cleanup is unavailable", 503
+        ) from error
+    for entry in entries:
+        try:
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "materialization cleanup path is unsafe",
+                    503,
+                )
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = _open_directory_fd(entry.name, parent_fd=fd)
+                assert child_fd is not None
+                try:
+                    _remove_tree_fd(child_fd)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(entry.name, dir_fd=fd)
+            elif stat.S_ISREG(info.st_mode):
+                os.unlink(entry.name, dir_fd=fd)
+            else:
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "materialization cleanup path is unsafe",
+                    503,
+                )
+        except MaterializationError:
+            raise
+        except OSError as error:
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH",
+                "materialization cleanup path changed",
+                503,
+            ) from error
 
 
 def _remove_tree_no_follow(path: Path) -> None:
@@ -1367,6 +1454,40 @@ class Materializer:
             "schema": schema,
         }
 
+    def open_artifact_fd(self, workspace_id: str) -> int:
+        directory, _, _ = self._paths(workspace_id)
+        workspace_name = directory.name
+        root_fd = _open_directory_fd(self.root)
+        assert root_fd is not None
+        version_fd: int | None = None
+        workspace_fd: int | None = None
+        artifact_fd: int | None = None
+        try:
+            version_fd = _open_directory_fd("v1", parent_fd=root_fd)
+            assert version_fd is not None
+            workspace_fd = _open_directory_fd(workspace_name, parent_fd=version_fd)
+            assert workspace_fd is not None
+            artifact_fd = _open_regular_fd(
+                "workspace.duckdb",
+                parent_fd=workspace_fd,
+            )
+            assert artifact_fd is not None
+            artifact = Path(f"/proc/self/fd/{workspace_fd}/workspace.duckdb")
+            self._verify_artifact_mac(artifact, artifact_fd=artifact_fd)
+            _assert_directory_binding(version_fd, workspace_name, workspace_fd)
+            _assert_path_binding(artifact, artifact_fd)
+            return artifact_fd
+        except Exception:
+            if artifact_fd is not None:
+                os.close(artifact_fd)
+            raise
+        finally:
+            if workspace_fd is not None:
+                os.close(workspace_fd)
+            if version_fd is not None:
+                os.close(version_fd)
+            os.close(root_fd)
+
     def artifact_path(self, workspace_id: str) -> Path:
         directory, final, _ = self._paths(workspace_id)
         _validate_directory(directory)
@@ -1375,11 +1496,41 @@ class Materializer:
         return final
 
     def delete(self, workspace_id: str) -> None:
-        directory, _, lock_path = self._paths(workspace_id)
-        with _lock(lock_path):
-            if not _validate_directory(directory, allow_missing=True):
-                return
-            _remove_tree_no_follow(directory)
+        directory, _, _ = self._paths(workspace_id)
+        workspace_name = directory.name
+        with _anchored_directory(self.root) as (root_fd, _):  # noqa: SIM117
+            with _anchored_directory(self.root / "v1", parent_fd=root_fd, name="v1") as (
+                version_fd,
+                _,
+            ):
+                with _anchored_directory(
+                    self.root / "v1" / ".locks",
+                    parent_fd=version_fd,
+                    name=".locks",
+                ) as (locks_fd, locks):
+                    lock_path = locks / f"{workspace_name}.lock"
+                    with _lock(lock_path, directory_fd=locks_fd):
+                        workspace_fd = _open_directory_fd(
+                            workspace_name,
+                            parent_fd=version_fd,
+                            allow_missing=True,
+                        )
+                        if workspace_fd is None:
+                            return
+                        try:
+                            _remove_tree_fd(workspace_fd)
+                        finally:
+                            os.close(workspace_fd)
+                        try:
+                            os.rmdir(workspace_name, dir_fd=version_fd)
+                        except FileNotFoundError:
+                            return
+                        except OSError as error:
+                            raise MaterializationError(
+                                "MATERIALIZATION_INTEGRITY_MISMATCH",
+                                "materialization workspace changed",
+                                503,
+                            ) from error
 
     @staticmethod
     def _is_known_artifact(path: Path) -> bool:
@@ -1391,72 +1542,176 @@ class Materializer:
             or path.name.startswith("workspace.tmp.")
         )
 
-    def cleanup_expired(self, ttl_seconds: int = 86_400, now: float | None = None) -> int:
-        if ttl_seconds < 1:
-            raise ValueError("ttl_seconds must be positive")
-        base = self.root / "v1"
-        if not _validate_directory(base, allow_missing=True):
-            return 0
-        current = now if now is not None else time.time()
-        cutoff = current - ttl_seconds
-        removed = 0
+    @staticmethod
+    def _remove_workspace_fd(
+        workspace_fd: int,
+        version_fd: int,
+        workspace_name: str,
+    ) -> None:
+        _remove_tree_fd(workspace_fd)
+        _assert_directory_binding(version_fd, workspace_name, workspace_fd)
         try:
-            entries = list(os.scandir(base))
-        except OSError:
-            return 0
+            os.rmdir(workspace_name, dir_fd=version_fd)
+        except OSError as error:
+            raise MaterializationError(
+                "MATERIALIZATION_INTEGRITY_MISMATCH",
+                "materialization workspace changed",
+                503,
+            ) from error
+
+    def _cleanup_workspace_fd(
+        self,
+        workspace_fd: int,
+        version_fd: int,
+        workspace_name: str,
+        cutoff: float,
+    ) -> bool:
+        final_fd = _open_regular_fd(
+            "workspace.duckdb",
+            parent_fd=workspace_fd,
+            allow_missing=True,
+        )
+        if final_fd is not None:
+            try:
+                if os.fstat(final_fd).st_mtime <= cutoff:
+                    self._remove_workspace_fd(workspace_fd, version_fd, workspace_name)
+                    return True
+            finally:
+                os.close(final_fd)
+            return False
+
+        try:
+            with os.scandir(workspace_fd) as iterator:
+                entries = list(iterator)
+        except OSError as error:
+            raise MaterializationError(
+                "MATERIALIZATION_UNAVAILABLE", "materialization cleanup is unavailable", 503
+            ) from error
         for entry in entries:
             try:
                 info = entry.stat(follow_symlinks=False)
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                    continue
-                workspace_id = str(UUID(entry.name))
-                if workspace_id != entry.name:
-                    continue
-                directory, final, lock_path = self._paths(workspace_id)
-                with _lock(lock_path):
-                    _validate_directory(directory)
-                    final_exists = _validate_regular_file(final, allow_missing=True)
-                    if final_exists:
-                        final_info = os.lstat(final)
-                        if final_info.st_mtime <= cutoff:
-                            _remove_tree_no_follow(directory)
-                            removed += 1
+            except OSError as error:
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "materialization cleanup path changed",
+                    503,
+                ) from error
+            if stat.S_ISLNK(info.st_mode):
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "materialization cleanup path is unsafe",
+                    503,
+                )
+            if (
+                stat.S_ISREG(info.st_mode)
+                and self._is_known_artifact(Path(entry.name))
+                and info.st_mtime <= cutoff
+            ):
+                try:
+                    os.unlink(entry.name, dir_fd=workspace_fd)
+                except OSError as error:
+                    raise MaterializationError(
+                        "MATERIALIZATION_INTEGRITY_MISMATCH",
+                        "materialization cleanup path changed",
+                        503,
+                    ) from error
+
+        try:
+            with os.scandir(workspace_fd) as iterator:
+                remaining = list(iterator)
+        except OSError as error:
+            raise MaterializationError(
+                "MATERIALIZATION_UNAVAILABLE", "materialization cleanup is unavailable", 503
+            ) from error
+        final_fd = _open_regular_fd(
+            "workspace.duckdb",
+            parent_fd=workspace_fd,
+            allow_missing=True,
+        )
+        if final_fd is not None:
+            os.close(final_fd)
+            return False
+        remaining_info: list[tuple[str, os.stat_result]] = []
+        for entry in remaining:
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise MaterializationError(
+                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                    "materialization cleanup path is unsafe",
+                    503,
+                )
+            remaining_info.append((entry.name, info))
+        if not remaining:
+            self._remove_workspace_fd(workspace_fd, version_fd, workspace_name)
+            return True
+        if all(self._is_known_artifact(Path(name)) for name, _ in remaining_info) and all(
+            info.st_mtime <= cutoff for _, info in remaining_info
+        ):
+            self._remove_workspace_fd(workspace_fd, version_fd, workspace_name)
+            return True
+        return False
+
+    def cleanup_expired(self, ttl_seconds: int = 86_400, now: float | None = None) -> int:
+        if ttl_seconds < 1:
+            raise ValueError("ttl_seconds must be positive")
+        current = now if now is not None else time.time()
+        cutoff = current - ttl_seconds
+        root_fd = _open_directory_fd(self.root, allow_missing=True)
+        if root_fd is None:
+            return 0
+        try:
+            version_fd = _open_directory_fd("v1", parent_fd=root_fd, allow_missing=True)
+            if version_fd is None:
+                return 0
+            try:
+                locks_fd = _open_directory_fd(".locks", parent_fd=version_fd, allow_missing=True)
+                if locks_fd is None:
+                    return 0
+                try:
+                    try:
+                        with os.scandir(version_fd) as iterator:
+                            entries = list(iterator)
+                    except OSError:
+                        return 0
+                    removed = 0
+                    for entry in entries:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                                continue
+                            workspace_id = str(UUID(entry.name))
+                            if workspace_id != entry.name:
+                                continue
+                            lock_path = Path(f"/proc/self/fd/{locks_fd}") / f"{workspace_id}.lock"
+                            with _lock(lock_path, directory_fd=locks_fd):
+                                workspace_fd = _open_directory_fd(
+                                    entry.name,
+                                    parent_fd=version_fd,
+                                    allow_missing=True,
+                                )
+                                if workspace_fd is None:
+                                    continue
+                                try:
+                                    if self._cleanup_workspace_fd(
+                                        workspace_fd,
+                                        version_fd,
+                                        workspace_id,
+                                        cutoff,
+                                    ):
+                                        removed += 1
+                                finally:
+                                    os.close(workspace_fd)
+                        except (OSError, ValueError, MaterializationError):
+                            # Hostile or concurrently changing state is fail-closed:
+                            # leave it for a later cleanup pass.
                             continue
-                    directory_entries = list(os.scandir(directory))
-                    for artifact_entry in directory_entries:
-                        artifact = Path(artifact_entry.path)
-                        artifact_info = artifact_entry.stat(follow_symlinks=False)
-                        if stat.S_ISLNK(artifact_info.st_mode):
-                            raise MaterializationError(
-                                "MATERIALIZATION_INTEGRITY_MISMATCH",
-                                "materialization cleanup path is unsafe",
-                                503,
-                            )
-                        if (
-                            stat.S_ISREG(artifact_info.st_mode)
-                            and self._is_known_artifact(artifact)
-                            and artifact_info.st_mtime <= cutoff
-                        ):
-                            artifact.unlink()
-                    remaining_entries = list(os.scandir(directory))
-                    remaining = [Path(item.path) for item in remaining_entries]
-                    final_exists = _validate_regular_file(final, allow_missing=True)
-                    if (
-                        not final_exists
-                        and remaining
-                        and all(self._is_known_artifact(item) for item in remaining)
-                        and all(os.lstat(item).st_mtime <= cutoff for item in remaining)
-                    ):
-                        _remove_tree_no_follow(directory)
-                        removed += 1
-                    elif not final_exists and not remaining:
-                        directory.rmdir()
-                        removed += 1
-            except (OSError, ValueError, MaterializationError):
-                # Hostile or concurrently changing state is fail-closed: leave
-                # it for a later cleanup pass rather than following/deleting it.
-                continue
-        return removed
+                    return removed
+                finally:
+                    os.close(locks_fd)
+            finally:
+                os.close(version_fd)
+        finally:
+            os.close(root_fd)
 
 
 def configured_token() -> str:

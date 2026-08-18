@@ -168,10 +168,17 @@ def _manifest(connection: duckdb.DuckDBPyConnection) -> dict[str, Any] | None:
     return dict(zip((column[0] for column in connection.description), row, strict=False))
 
 
-def _open_artifact(artifact: Path) -> tuple[int, duckdb.DuckDBPyConnection]:
+def _open_artifact(
+    artifact: Path,
+    materializer: Materializer | None = None,
+    workspace_id: str | None = None,
+) -> tuple[int, duckdb.DuckDBPyConnection]:
     try:
-        fd = os.open(artifact, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError as error:
+        if materializer is not None and workspace_id is not None:
+            fd = materializer.open_artifact_fd(workspace_id)
+        else:
+            fd = os.open(artifact, os.O_RDONLY | os.O_NOFOLLOW)
+    except (OSError, MaterializationError) as error:
         raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace data is unavailable") from error
     try:
         connection = duckdb.connect(f"/proc/self/fd/{fd}", read_only=True)
@@ -186,10 +193,11 @@ def _validate_artifact(
     workspace_id: str,
     expected_signature: str | None,
     expected_version: int | None,
+    materializer: Materializer | None = None,
 ) -> None:
     fd: int | None = None
     try:
-        fd, connection = _open_artifact(artifact)
+        fd, connection = _open_artifact(artifact, materializer, workspace_id)
         with connection:
             _configure_read_only(connection)
             # The manifest alone is not sufficient: require the fixed data
@@ -400,12 +408,26 @@ class MaxunWorkspaceEngine(QueryEngine):
         self._root = root
         self.expected_signature = expected_signature
         self.expected_version = expected_version
-        self._artifact = _workspace_artifact_path(self.workspace_id, root)
+        try:
+            self._materializer = Materializer(root)
+            self._artifact = self._materializer.artifact_path(self.workspace_id)
+        except (MaterializationError, ValueError) as error:
+            code = (
+                "MAXUN_WORKSPACE_INTEGRITY"
+                if isinstance(error, MaterializationError)
+                and error.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+                else "MAXUN_WORKSPACE_INVALID"
+                if isinstance(error, MaterializationError)
+                and error.code == "MATERIALIZATION_INVALID_CONTRACT"
+                else "MAXUN_WORKSPACE_UNAVAILABLE"
+            )
+            raise MaxunQueryError(code, "Workspace data is unavailable") from error
         _validate_artifact(
             self._artifact,
             self.workspace_id,
             expected_signature,
             expected_version,
+            self._materializer,
         )
         self._closed = False
         self._turn_query_tool_limit: int | None = None
@@ -441,7 +463,7 @@ class MaxunWorkspaceEngine(QueryEngine):
         connection: duckdb.DuckDBPyConnection | None = None
         fd: int | None = None
         try:
-            fd, connection = _open_artifact(self._artifact)
+            fd, connection = _open_artifact(self._artifact, self._materializer, self.workspace_id)
             holder["connection"] = connection
             holder["fd"] = fd
             _configure_read_only(connection)
@@ -607,7 +629,7 @@ class MaxunWorkspaceEngine(QueryEngine):
         connection: duckdb.DuckDBPyConnection | None = None
         fd: int | None = None
         try:
-            fd, connection = _open_artifact(self._artifact)
+            fd, connection = _open_artifact(self._artifact, self._materializer, self.workspace_id)
             holder["connection"] = connection
             holder["fd"] = fd
             _configure_read_only(connection)
@@ -754,7 +776,7 @@ class MaxunWorkspaceEngine(QueryEngine):
         connection: duckdb.DuckDBPyConnection | None = None
         fd: int | None = None
         try:
-            fd, connection = _open_artifact(self._artifact)
+            fd, connection = _open_artifact(self._artifact, self._materializer, self.workspace_id)
             holder["connection"] = connection
             holder["fd"] = fd
             _configure_read_only(connection)
