@@ -25,6 +25,13 @@ api_router.include_router(connectors.router)
 api_router.include_router(maxun_materialization.router)
 api_router.include_router(maxun_conversations.router)
 
+# The Maxun deployment uses this deliberately narrow router instead of the
+# general application router. Keep generic chat/settings/OAuth/connector
+# routes out of this surface; network privacy is not an authorization control.
+maxun_api_router = APIRouter()
+maxun_api_router.include_router(maxun_materialization.router)
+maxun_api_router.include_router(maxun_conversations.router)
+
 # Simple in-memory cache for GitHub release data (avoids hammering the API)
 _releases_cache: dict[str, Any] = {}
 _CACHE_TTL = 3600  # 1 hour

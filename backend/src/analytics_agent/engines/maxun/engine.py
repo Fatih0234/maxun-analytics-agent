@@ -16,7 +16,6 @@ import datetime as dt
 import decimal
 import logging
 import os
-import stat
 import threading
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,7 @@ from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import traverse_scope
 
 from analytics_agent.engines.base import QueryEngine
-from analytics_agent.maxun.materialization import Materializer
+from analytics_agent.maxun.materialization import MaterializationError, Materializer
 
 logger = logging.getLogger(__name__)
 
@@ -126,32 +125,20 @@ def _workspace_artifact_path(workspace_id: str, root: str | Path | None = None) 
     """
 
     canonical = _canonical_workspace_id(workspace_id)
-    materializer = Materializer(root)
-    root_path = materializer.root
-    version_path = root_path / "v1"
-    if root_path.is_symlink() or version_path.is_symlink():
-        raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace is unavailable")
-    base = version_path.resolve()
-    candidate = base / canonical
-    if candidate.is_symlink():
-        raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace is unavailable")
-    directory = candidate.resolve()
-    if directory.parent != base or directory.name != canonical:
-        raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace is unavailable")
-    artifact = directory / "workspace.duckdb"
-    if artifact.is_symlink() or not artifact.is_file():
-        raise MaxunQueryError("MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable")
     try:
-        if (
-            stat.S_IMODE(directory.stat().st_mode) & 0o077
-            or stat.S_IMODE(artifact.stat().st_mode) & 0o077
-        ):
-            raise MaxunQueryError("MAXUN_WORKSPACE_INTEGRITY", "Workspace data is unavailable")
-    except OSError as error:
-        raise MaxunQueryError(
-            "MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable"
-        ) from error
-    return artifact
+        materializer = Materializer(root)
+        return materializer.artifact_path(canonical)
+    except (MaterializationError, ValueError) as error:
+        code = (
+            "MAXUN_WORKSPACE_INTEGRITY"
+            if isinstance(error, MaterializationError)
+            and error.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+            else "MAXUN_WORKSPACE_INVALID"
+            if isinstance(error, MaterializationError)
+            and error.code == "MATERIALIZATION_INVALID_CONTRACT"
+            else "MAXUN_WORKSPACE_UNAVAILABLE"
+        )
+        raise MaxunQueryError(code, "Workspace data is unavailable") from error
 
 
 def _configure_read_only(connection: duckdb.DuckDBPyConnection) -> None:
@@ -181,14 +168,37 @@ def _manifest(connection: duckdb.DuckDBPyConnection) -> dict[str, Any] | None:
     return dict(zip((column[0] for column in connection.description), row, strict=False))
 
 
+def _open_artifact(
+    artifact: Path,
+    materializer: Materializer | None = None,
+    workspace_id: str | None = None,
+) -> tuple[int, duckdb.DuckDBPyConnection]:
+    try:
+        if materializer is not None and workspace_id is not None:
+            fd = materializer.open_artifact_fd(workspace_id)
+        else:
+            fd = os.open(artifact, os.O_RDONLY | os.O_NOFOLLOW)
+    except (OSError, MaterializationError) as error:
+        raise MaxunQueryError("MAXUN_WORKSPACE_INVALID", "Workspace data is unavailable") from error
+    try:
+        connection = duckdb.connect(f"/proc/self/fd/{fd}", read_only=True)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd, connection
+
+
 def _validate_artifact(
     artifact: Path,
     workspace_id: str,
     expected_signature: str | None,
     expected_version: int | None,
+    materializer: Materializer | None = None,
 ) -> None:
+    fd: int | None = None
     try:
-        with duckdb.connect(str(artifact), read_only=True) as connection:
+        fd, connection = _open_artifact(artifact, materializer, workspace_id)
+        with connection:
             _configure_read_only(connection)
             # The manifest alone is not sufficient: require the fixed data
             # relation and column manifest to exist before exposing an engine.
@@ -202,6 +212,9 @@ def _validate_artifact(
         raise MaxunQueryError(
             "MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable"
         ) from error
+    finally:
+        if fd is not None:
+            os.close(fd)
 
     if not found:
         raise MaxunQueryError("MAXUN_WORKSPACE_UNAVAILABLE", "Workspace data is unavailable")
@@ -395,12 +408,26 @@ class MaxunWorkspaceEngine(QueryEngine):
         self._root = root
         self.expected_signature = expected_signature
         self.expected_version = expected_version
-        self._artifact = _workspace_artifact_path(self.workspace_id, root)
+        try:
+            self._materializer = Materializer(root)
+            self._artifact = self._materializer.artifact_path(self.workspace_id)
+        except (MaterializationError, ValueError) as error:
+            code = (
+                "MAXUN_WORKSPACE_INTEGRITY"
+                if isinstance(error, MaterializationError)
+                and error.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+                else "MAXUN_WORKSPACE_INVALID"
+                if isinstance(error, MaterializationError)
+                and error.code == "MATERIALIZATION_INVALID_CONTRACT"
+                else "MAXUN_WORKSPACE_UNAVAILABLE"
+            )
+            raise MaxunQueryError(code, "Workspace data is unavailable") from error
         _validate_artifact(
             self._artifact,
             self.workspace_id,
             expected_signature,
             expected_version,
+            self._materializer,
         )
         self._closed = False
         self._turn_query_tool_limit: int | None = None
@@ -434,9 +461,11 @@ class MaxunWorkspaceEngine(QueryEngine):
 
     def _execute_query(self, sql: str, holder: dict[str, Any]) -> dict[str, Any]:
         connection: duckdb.DuckDBPyConnection | None = None
+        fd: int | None = None
         try:
-            connection = duckdb.connect(str(self._artifact), read_only=True)
+            fd, connection = _open_artifact(self._artifact, self._materializer, self.workspace_id)
             holder["connection"] = connection
+            holder["fd"] = fd
             _configure_read_only(connection)
             cursor = connection.execute(sql)
             description = cursor.description or []
@@ -474,7 +503,10 @@ class MaxunWorkspaceEngine(QueryEngine):
         finally:
             if connection is not None:
                 connection.close()
+            if fd is not None:
+                os.close(fd)
             holder["connection"] = None
+            holder["fd"] = None
 
     def configure_turn_budget(
         self, *, max_query_tools: int = 3, max_sql_executions: int = 1
@@ -595,9 +627,11 @@ class MaxunWorkspaceEngine(QueryEngine):
 
     def _execute_source_context(self, holder: dict[str, Any]) -> dict[str, Any]:
         connection: duckdb.DuckDBPyConnection | None = None
+        fd: int | None = None
         try:
-            connection = duckdb.connect(str(self._artifact), read_only=True)
+            fd, connection = _open_artifact(self._artifact, self._materializer, self.workspace_id)
             holder["connection"] = connection
+            holder["fd"] = fd
             _configure_read_only(connection)
             cursor = connection.execute(
                 "SELECT source_order, display_name, role, source_dataset_key, captured_at, row_count "
@@ -660,7 +694,10 @@ class MaxunWorkspaceEngine(QueryEngine):
         finally:
             if connection is not None:
                 connection.close()
+            if fd is not None:
+                os.close(fd)
             holder["connection"] = None
+            holder["fd"] = None
 
     def _run_source_context(self) -> dict[str, Any]:
         if self._closed:
@@ -737,9 +774,11 @@ class MaxunWorkspaceEngine(QueryEngine):
 
     def _execute_schema(self, holder: dict[str, Any]) -> list[dict[str, Any]]:
         connection: duckdb.DuckDBPyConnection | None = None
+        fd: int | None = None
         try:
-            connection = duckdb.connect(str(self._artifact), read_only=True)
+            fd, connection = _open_artifact(self._artifact, self._materializer, self.workspace_id)
             holder["connection"] = connection
+            holder["fd"] = fd
             _configure_read_only(connection)
             cursor = connection.execute("SELECT * FROM data LIMIT 0")
             return [
@@ -749,7 +788,10 @@ class MaxunWorkspaceEngine(QueryEngine):
         finally:
             if connection is not None:
                 connection.close()
+            if fd is not None:
+                os.close(fd)
             holder["connection"] = None
+            holder["fd"] = None
 
     def _run_schema(self) -> list[dict[str, Any]] | dict[str, str]:
         if self._closed:

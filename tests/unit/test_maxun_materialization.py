@@ -455,6 +455,232 @@ def test_digest_matches_cross_runtime_golden_vector():
     )
 
 
+def test_artifact_mac_is_required_when_enabled(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MAXUN_REQUIRE_ARTIFACT_MAC", "true")
+    monkeypatch.delenv("MAXUN_ARTIFACT_INTEGRITY_KEY", raising=False)
+    with pytest.raises(ValueError, match="ARTIFACT_INTEGRITY_KEY"):
+        Materializer(tmp_path)
+
+
+def test_artifact_mac_detects_volume_writer_tampering(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MAXUN_REQUIRE_ARTIFACT_MAC", "true")
+    monkeypatch.setenv("MAXUN_ARTIFACT_INTEGRITY_KEY", "dedicated-phase7-mac-key")
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    artifact = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    mac = artifact.with_name("workspace.duckdb.mac")
+    assert mac.stat().st_mode & 0o777 == 0o600
+    with artifact.open("ab") as handle:
+        handle.write(b"tampered")
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(request)
+    assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+
+
+def test_materialization_rejects_symlinked_workspace_directory(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(MaterializationRequest.model_validate(payload()))
+    assert error.value.code == "MATERIALIZATION_INVALID_CONTRACT"
+    assert not (outside / "workspace.duckdb").exists()
+
+
+def test_materialization_rejects_symlinked_lock_path(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    outside = tmp_path / "outside.lock"
+    outside.write_bytes(b"must remain")
+    lock_path = tmp_path / "v1" / ".locks" / f"{IDS['workspace']}.lock"
+    lock_path.symlink_to(outside)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(MaterializationRequest.model_validate(payload()))
+    assert error.value.code == "MATERIALIZATION_INVALID_CONTRACT"
+    assert outside.read_bytes() == b"must remain"
+
+
+def test_materialization_fails_closed_on_root_permission_drift(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    os.chmod(tmp_path, 0o755)
+    try:
+        with pytest.raises(MaterializationError) as error:
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+    finally:
+        os.chmod(tmp_path, 0o700)
+
+
+def test_descriptor_anchor_rejects_lock_directory_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    locks_dir = tmp_path / "v1" / ".locks"
+    backup = tmp_path / "v1" / ".locks.original"
+    outside = tmp_path.parent / f"{tmp_path.name}-locks-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == ".locks" and not swapped:
+            locks_dir.rename(backup)
+            locks_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not list(outside.iterdir())
+    finally:
+        if locks_dir.is_symlink():
+            locks_dir.unlink()
+        if backup.exists():
+            backup.rename(locks_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_descriptor_anchor_rejects_workspace_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.mkdir(mode=0o700)
+    os.chmod(workspace_dir, 0o700)
+    outside = tmp_path.parent / f"{tmp_path.name}-workspace-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == IDS["workspace"] and not swapped:
+            workspace_dir.rmdir()
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not (outside / "workspace.duckdb").exists()
+    finally:
+        if workspace_dir.is_symlink():
+            workspace_dir.unlink()
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_descriptor_anchor_rejects_version_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    version_dir = tmp_path / "v1"
+    backup = tmp_path / "v1.original"
+    outside = tmp_path.parent / f"{tmp_path.name}-version-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == "v1" and not swapped:
+            version_dir.rename(backup)
+            version_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not (outside / IDS["workspace"] / "workspace.duckdb").exists()
+    finally:
+        if version_dir.is_symlink():
+            version_dir.unlink()
+        if backup.exists():
+            backup.rename(version_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_descriptor_anchor_rejects_root_replacement(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    backup = tmp_path.parent / f"{tmp_path.name}-root-original"
+    outside = tmp_path.parent / f"{tmp_path.name}-root-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is None and Path(path) == tmp_path and not swapped:
+            tmp_path.rename(backup)
+            tmp_path.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.materialize(MaterializationRequest.model_validate(payload()))
+        assert swapped
+        assert not (outside / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
+    finally:
+        if tmp_path.is_symlink():
+            tmp_path.unlink()
+        if backup.exists():
+            backup.rename(tmp_path)
+        if outside.exists():
+            outside.rmdir()
+
+
+def test_materialization_rejects_final_replacement_after_descriptor_open(
+    tmp_path: Path, monkeypatch
+):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    final = tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb"
+    backup = final.with_name("workspace.duckdb.original")
+    outside = tmp_path.parent / f"{tmp_path.name}-final-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_verify = materializer._verify_artifact_mac
+    swapped = False
+
+    def verify_then_swap(artifact, artifact_fd=None):
+        nonlocal swapped
+        original_verify(artifact, artifact_fd=artifact_fd)
+        if artifact_fd is not None and not swapped:
+            final.rename(backup)
+            final.symlink_to(outside / "outside.duckdb")
+            swapped = True
+
+    monkeypatch.setattr(materializer, "_verify_artifact_mac", verify_then_swap)
+    try:
+        with pytest.raises(MaterializationError) as error:
+            materializer.materialize(request)
+        assert error.value.code == "MATERIALIZATION_INTEGRITY_MISMATCH"
+        assert swapped
+        assert not (outside / "outside.duckdb").exists()
+    finally:
+        if final.is_symlink():
+            final.unlink()
+        if backup.exists():
+            backup.rename(final)
+        if outside.exists():
+            outside.rmdir()
+
+
 def test_untrusted_metadata_cannot_change_materialization_path(tmp_path: Path):
     body = payload()
     body["sources"][0]["sourceDatasetKey"] = "../../outside"
@@ -501,6 +727,66 @@ def test_failed_build_does_not_publish_partial_final_file(tmp_path: Path, monkey
     workspace_dir = tmp_path / "v1" / IDS["workspace"]
     assert not (workspace_dir / "workspace.duckdb").exists()
     assert not list(workspace_dir.glob("workspace.tmp.*.duckdb"))
+
+
+def test_materialization_cancel_before_worker_registration_is_sticky(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert materializer.cancel_operation(IDS["workspace"], operation_id)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(request, operation_id=operation_id, deadline_at=time.time() + 30)
+    assert error.value.code == "MATERIALIZATION_CANCELLED"
+
+
+def test_materialization_deadline_fails_before_publish(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(
+            request,
+            operation_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            deadline_at=time.time() - 1,
+        )
+    assert error.value.code == "MATERIALIZATION_TIMEOUT"
+    assert not (tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
+
+
+def test_materialization_cancellation_converges_before_publish(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    entered = Event()
+
+    def blocked_build(*args, **kwargs):
+        operation = kwargs.get("operation") or args[3]
+        entered.set()
+        while True:
+            operation.check()
+
+    original_build = materializer._build
+    materializer._build = blocked_build
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            materializer.materialize,
+            request,
+            None,
+            operation_id,
+            time.time() + 30,
+        )
+        assert entered.wait(2)
+        assert materializer.cancel_operation(IDS["workspace"], operation_id)
+        with pytest.raises(MaterializationError) as error:
+            future.result(timeout=2)
+    assert error.value.code == "MATERIALIZATION_CANCELLED"
+    assert not (tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
+    materializer._build = original_build
+    rebuilt = materializer.materialize(
+        request,
+        operation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        deadline_at=time.time() + 30,
+    )
+    assert rebuilt["state"] == "ready"
 
 
 def test_materialization_capacity_returns_bounded_busy_error(tmp_path: Path):
@@ -574,6 +860,53 @@ def test_stable_lock_blocks_rebuild_after_delete_removes_directory(tmp_path: Pat
     assert started.is_set()
 
 
+def test_delete_fails_closed_on_symlinked_workspace(tmp_path: Path):
+    materializer = Materializer(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(MaterializationError) as error:
+        materializer.delete(IDS["workspace"])
+    assert error.value.code == "MATERIALIZATION_INVALID_CONTRACT"
+    assert outside.exists()
+
+
+def test_delete_rejects_workspace_replacement_after_lock_acquisition(tmp_path: Path, monkeypatch):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    materializer.materialize(request)
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    backup = tmp_path / "v1" / f"{IDS['workspace']}.original"
+    outside = tmp_path.parent / f"{tmp_path.name}-delete-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == IDS["workspace"] and not swapped:
+            workspace_dir.rename(backup)
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        with pytest.raises(MaterializationError):
+            materializer.delete(IDS["workspace"])
+        assert swapped
+        assert not list(outside.iterdir())
+    finally:
+        if workspace_dir.is_symlink():
+            workspace_dir.unlink()
+        if backup.exists():
+            backup.rename(workspace_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
 def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
@@ -584,10 +917,48 @@ def test_ttl_cleanup_removes_only_expired_workspace(tmp_path: Path):
     assert not database.exists()
 
 
+def test_ttl_cleanup_rejects_workspace_replacement_after_lock_scan(tmp_path: Path, monkeypatch):
+    materializer = Materializer(tmp_path)
+    workspace_dir = tmp_path / "v1" / IDS["workspace"]
+    workspace_dir.mkdir(mode=0o700)
+    os.chmod(workspace_dir, 0o700)
+    temp = workspace_dir / "workspace.tmp.crashed.duckdb.wal"
+    temp.write_bytes(b"orphan")
+    os.utime(temp, (100, 100))
+    backup = tmp_path / "v1" / f"{IDS['workspace']}.cleanup-original"
+    outside = tmp_path.parent / f"{tmp_path.name}-cleanup-outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and str(path) == IDS["workspace"] and not swapped:
+            workspace_dir.rename(backup)
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    try:
+        assert materializer.cleanup_expired(ttl_seconds=10, now=111) == 0
+        assert swapped
+        assert not list(outside.iterdir())
+    finally:
+        if workspace_dir.is_symlink():
+            workspace_dir.unlink()
+        if backup.exists():
+            backup.rename(workspace_dir)
+        if outside.exists():
+            outside.rmdir()
+
+
 def test_ttl_cleanup_removes_stale_final_less_temp_files(tmp_path: Path):
     materializer = Materializer(tmp_path)
     directory = tmp_path / "v1" / IDS["workspace"]
-    directory.mkdir()
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
     temp = directory / "workspace.tmp.crashed.duckdb.wal"
     temp.write_bytes(b"orphan")
     os.utime(temp, (100, 100))
@@ -598,7 +969,8 @@ def test_ttl_cleanup_removes_stale_final_less_temp_files(tmp_path: Path):
 def test_ttl_cleanup_keeps_fresh_final_less_temp_files(tmp_path: Path):
     materializer = Materializer(tmp_path)
     directory = tmp_path / "v1" / IDS["workspace"]
-    directory.mkdir()
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
     temp = directory / "workspace.tmp.active.duckdb"
     temp.write_bytes(b"active")
     os.utime(temp, (105, 105))
@@ -679,6 +1051,51 @@ def test_internal_http_route_enforces_token_and_returns_bounded_response(
     assert response.status_code == 200
     assert response.json()["relation"] == "data"
     assert "workspace.duckdb" not in response.text
+
+
+async def test_http_materialization_cancellation_converges(tmp_path: Path, monkeypatch):
+    app = FastAPI()
+    app.include_router(maxun_api.router)
+    monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", "internal-secret")
+    materializer = Materializer(tmp_path)
+    entered = Event()
+
+    def blocked_build(*args, **kwargs):
+        operation = kwargs.get("operation") or args[3]
+        entered.set()
+        while True:
+            operation.check()
+
+    materializer._build = blocked_build
+    monkeypatch.setattr(maxun_api, "_materializer", materializer)
+    body = payload()
+    operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        materialization = asyncio.create_task(
+            client.put(
+                f"/internal/maxun/materializations/{IDS['workspace']}",
+                headers={
+                    "Authorization": "Bearer internal-secret",
+                    "X-Maxun-Operation-Id": operation_id,
+                    "X-Maxun-Deadline-At": str(int(time.time() * 1000) + 30_000),
+                },
+                json=body,
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        cancelled = await client.post(
+            f"/internal/maxun/materializations/{IDS['workspace']}/cancel",
+            headers={
+                "Authorization": "Bearer internal-secret",
+                "X-Maxun-Operation-Id": operation_id,
+            },
+        )
+        assert cancelled.status_code == 204
+        completed = await materialization
+    assert completed.status_code == 409
+    assert completed.json()["detail"]["code"] == "MATERIALIZATION_CANCELLED"
 
 
 async def test_http_materialization_does_not_block_lightweight_requests(
