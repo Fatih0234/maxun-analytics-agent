@@ -15,7 +15,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import duckdb
 import rfc8785
@@ -31,6 +31,8 @@ MAX_ROWS = 50_000
 MAX_CELLS = 1_000_000
 MAX_CELL_BYTES = 1_048_576
 MAX_REQUEST_BYTES = 128 * 1024 * 1024
+MAX_MATERIALIZATION_HARD_SECONDS = 300.0
+MAX_MATERIALIZATION_CANCEL_WAIT_SECONDS = 15.0
 RESERVED_COLUMNS = {
     "_source",
     "_source_role",
@@ -467,8 +469,55 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+class _MaterializationOperation:
+    def __init__(self, operation_id: str, workspace_id: str, deadline_at: float | None):
+        self.operation_id = operation_id
+        self.workspace_id = workspace_id
+        now = time.time()
+        requested_deadline = (
+            deadline_at if deadline_at is not None else now + MAX_MATERIALIZATION_HARD_SECONDS
+        )
+        self.deadline_at = min(requested_deadline, now + MAX_MATERIALIZATION_HARD_SECONDS)
+        self.cancelled = threading.Event()
+        self.done = threading.Event()
+        self._connection: duckdb.DuckDBPyConnection | None = None
+        self._connection_lock = threading.Lock()
+
+    def check(self) -> None:
+        if self.cancelled.is_set():
+            raise MaterializationError(
+                "MATERIALIZATION_CANCELLED", "materialization was cancelled", 409
+            )
+        if time.time() >= self.deadline_at:
+            self.cancelled.set()
+            self.interrupt()
+            raise MaterializationError("MATERIALIZATION_TIMEOUT", "materialization timed out", 504)
+
+    def set_connection(self, connection: duckdb.DuckDBPyConnection | None) -> None:
+        with self._connection_lock:
+            self._connection = connection
+            if connection is not None and self.cancelled.is_set():
+                try:
+                    connection.interrupt()
+                except Exception:
+                    pass
+
+    def interrupt(self) -> None:
+        with self._connection_lock:
+            connection = self._connection
+        if connection is not None:
+            try:
+                connection.interrupt()
+            except Exception:
+                pass
+
+    def request_cancel(self) -> None:
+        self.cancelled.set()
+        self.interrupt()
+
+
 @contextmanager
-def _lock(path: Path) -> Iterator[None]:
+def _lock(path: Path, operation: _MaterializationOperation | None = None) -> Iterator[None]:
     import fcntl
 
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -476,7 +525,14 @@ def _lock(path: Path) -> Iterator[None]:
     path.touch(mode=0o600, exist_ok=True)
     path.chmod(0o600)
     with path.open("r+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        while True:
+            if operation is not None:
+                operation.check()
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(0.05)
         try:
             yield
         finally:
@@ -533,15 +589,76 @@ class Materializer:
             raise ValueError("MAXUN_MATERIALIZATION_WAIT_SECONDS must be between 0.1 and 300")
         self._wait_seconds = wait_seconds
         self._semaphore = threading.BoundedSemaphore(concurrency)
+        self._operations: dict[str, _MaterializationOperation] = {}
+        self._operations_lock = threading.Lock()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
         (self.root / "v1" / ".locks").mkdir(mode=0o700, parents=True, exist_ok=True)
         (self.root / "v1").chmod(0o700)
         (self.root / "v1" / ".locks").chmod(0o700)
 
+    def _begin_operation(
+        self,
+        workspace_id: str,
+        operation_id: str | None,
+        deadline_at: float | None,
+    ) -> _MaterializationOperation:
+        canonical_workspace = str(_uuid(workspace_id))
+        canonical_operation = str(uuid4()) if operation_id is None else str(_uuid(operation_id))
+        if operation_id is not None and canonical_operation != operation_id:
+            raise MaterializationError(
+                "MATERIALIZATION_INVALID_CONTRACT", "invalid operation id", 400
+            )
+        operation = _MaterializationOperation(canonical_operation, canonical_workspace, deadline_at)
+        with self._operations_lock:
+            if canonical_operation in self._operations:
+                raise MaterializationError(
+                    "MATERIALIZATION_BUSY", "materialization operation is already active", 409
+                )
+            self._operations[canonical_operation] = operation
+        return operation
+
+    def _finish_operation(self, operation: _MaterializationOperation) -> None:
+        operation.done.set()
+        with self._operations_lock:
+            self._operations.pop(operation.operation_id, None)
+
+    def cancel_operation(self, workspace_id: str, operation_id: str) -> bool:
+        canonical_workspace = str(_uuid(workspace_id))
+        canonical_operation = str(_uuid(operation_id))
+        if canonical_operation != operation_id:
+            raise MaterializationError(
+                "MATERIALIZATION_INVALID_CONTRACT", "invalid operation id", 400
+            )
+        with self._operations_lock:
+            operation = self._operations.get(canonical_operation)
+        if operation is None:
+            return True
+        if operation.workspace_id != canonical_workspace:
+            raise MaterializationError(
+                "MATERIALIZATION_INVALID_CONTRACT", "operation workspace mismatch", 409
+            )
+        operation.request_cancel()
+        if not operation.done.wait(MAX_MATERIALIZATION_CANCEL_WAIT_SECONDS):
+            raise MaterializationError(
+                "MATERIALIZATION_CANCEL_NOT_CONVERGED",
+                "materialization cancellation did not converge",
+                503,
+            )
+        return True
+
     @contextmanager
-    def _capacity(self) -> Iterator[None]:
-        if not self._semaphore.acquire(timeout=self._wait_seconds):
+    def _capacity(self, operation: _MaterializationOperation | None = None) -> Iterator[None]:
+        deadline = time.monotonic() + self._wait_seconds
+        acquired = False
+        while not acquired:
+            if operation is not None:
+                operation.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            acquired = self._semaphore.acquire(timeout=min(0.1, remaining))
+        if not acquired:
             raise MaterializationError(
                 "MATERIALIZATION_BUSY", "materialization capacity is busy", 409
             )
@@ -557,47 +674,70 @@ class Materializer:
         return directory, directory / "workspace.duckdb", lock_path
 
     def materialize(
-        self, request: MaterializationRequest, request_bytes: int | None = None
+        self,
+        request: MaterializationRequest,
+        request_bytes: int | None = None,
+        operation_id: str | None = None,
+        deadline_at: float | None = None,
     ) -> dict[str, Any]:
         if request_bytes is not None and request_bytes > MAX_REQUEST_BYTES:
             raise MaterializationError(
                 "MATERIALIZATION_LIMIT_EXCEEDED", "request is too large", 413
             )
-        digest = input_digest(request)
-        directory, final, lock_path = self._paths(request.workspace.id)
-        with self._capacity(), _lock(lock_path):
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            directory.chmod(0o700)
-            if final.exists():
+        operation = self._begin_operation(request.workspace.id, operation_id, deadline_at)
+        try:
+            operation.check()
+            digest = input_digest(request)
+            directory, final, lock_path = self._paths(request.workspace.id)
+            with self._capacity(operation), _lock(lock_path, operation):
+                operation.check()
+                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                directory.chmod(0o700)
+                if final.exists():
+                    try:
+                        with duckdb.connect(str(final), read_only=True) as existing:
+                            found = _manifest(existing)
+                            if found and found.get("input_digest") == digest:
+                                # A successful integrity-checked access is a lease
+                                # refresh for the disposable artifact. Cleanup is
+                                # serialized by this same workspace lock.
+                                operation.check()
+                                os.utime(final, None)
+                                return self._response(request, digest, found, existing)
+                            if (
+                                found
+                                and found.get("data_signature") == request.workspace.dataSignature
+                            ):
+                                raise MaterializationError(
+                                    "MATERIALIZATION_INTEGRITY_MISMATCH",
+                                    "materialization input changed",
+                                    409,
+                                )
+                    except MaterializationError:
+                        raise
+                    except Exception:
+                        final.unlink(missing_ok=True)
+                temp = directory / f"workspace.tmp.{secrets.token_hex(12)}.duckdb"
                 try:
-                    with duckdb.connect(str(final), read_only=True) as existing:
-                        found = _manifest(existing)
-                        if found and found.get("input_digest") == digest:
-                            # A successful integrity-checked access is a lease
-                            # refresh for the disposable artifact. Cleanup is
-                            # serialized by this same workspace lock.
-                            os.utime(final, None)
-                            return self._response(request, digest, found, existing)
-                        if found and found.get("data_signature") == request.workspace.dataSignature:
-                            raise MaterializationError(
-                                "MATERIALIZATION_INTEGRITY_MISMATCH",
-                                "materialization input changed",
-                                409,
-                            )
-                except MaterializationError:
-                    raise
+                    response = self._build(request, digest, temp, operation)
+                    operation.check()
+                    os.replace(temp, final)
+                    return response
                 except Exception:
-                    final.unlink(missing_ok=True)
-            temp = directory / f"workspace.tmp.{secrets.token_hex(12)}.duckdb"
-            try:
-                response = self._build(request, digest, temp)
-                os.replace(temp, final)
-                return response
-            except Exception:
-                temp.unlink(missing_ok=True)
-                raise
+                    temp.unlink(missing_ok=True)
+                    raise
+        finally:
+            self._finish_operation(operation)
 
-    def _build(self, request: MaterializationRequest, digest: str, path: Path) -> dict[str, Any]:
+    def _build(
+        self,
+        request: MaterializationRequest,
+        digest: str,
+        path: Path,
+        operation: _MaterializationOperation | None = None,
+    ) -> dict[str, Any]:
+        if operation is not None:
+            operation.check()
         columns = request.sources[0].projection.columns
         physical = _physical_names(columns)
         all_values = [
@@ -610,6 +750,8 @@ class Materializer:
         ]
         specs = []
         for ordinal, (logical, name, mapped) in enumerate(physical):
+            if operation is not None:
+                operation.check()
             hint = _hint(request.workspace.dataFormatSnapshot, logical)
             dtype, rule = _type_and_rule(all_values[ordinal], hint)
             if len(request.sources) > 1 and hint in STRICT_ANALYTICAL_HINTS and dtype == "VARCHAR":
@@ -621,11 +763,17 @@ class Materializer:
             if dtype != "VARCHAR":
                 try:
                     for value in all_values[ordinal]:
+                        if operation is not None:
+                            operation.check()
                         _convert(value, dtype, rule)
                 except (ValueError, TypeError):
                     dtype, rule = "VARCHAR", f"{rule}-fallback-varchar"
             specs.append((ordinal, logical, name, dtype, rule, mapped))
+        if operation is not None:
+            operation.check()
         connection = duckdb.connect(str(path))
+        if operation is not None:
+            operation.set_connection(connection)
         try:
             _settings(connection)
             connection.execute("BEGIN TRANSACTION")
@@ -644,6 +792,8 @@ class Materializer:
                 "CREATE TABLE __maxun_columns (ordinal INTEGER, logical_name VARCHAR, physical_name VARCHAR, declared_type VARCHAR, duckdb_type VARCHAR, conversion_rule VARCHAR, identifier_was_mapped BOOLEAN)"
             )
             for spec in specs:
+                if operation is not None:
+                    operation.check()
                 connection.execute(
                     "INSERT INTO __maxun_columns VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [
@@ -663,11 +813,15 @@ class Materializer:
             placeholders = ",".join("?" for _ in insert_names)
             sql = f"INSERT INTO data ({','.join(_quote(name) for name in insert_names)}) VALUES ({placeholders})"
             for source in sorted(request.sources, key=lambda item: item.sourceOrder):
+                if operation is not None:
+                    operation.check()
                 try:
                     captured = _parse_timestamp(source.capturedAt)
                 except (ValueError, TypeError):
                     captured = None
                 for row in source.projection.rows:
+                    if operation is not None:
+                        operation.check()
                     values = []
                     for spec in specs:
                         try:
@@ -730,8 +884,14 @@ class Materializer:
             connection.execute("CHECKPOINT")
         finally:
             connection.close()
+            if operation is not None:
+                operation.set_connection(None)
+        if operation is not None:
+            operation.check()
         path.chmod(0o600)
         with duckdb.connect(str(path), read_only=True) as check:
+            if operation is not None:
+                operation.check()
             found = _manifest(check)
             if not found or found.get("input_digest") != digest:
                 raise MaterializationError(

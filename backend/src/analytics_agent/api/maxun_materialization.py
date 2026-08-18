@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import math
-from uuid import UUID
+import time
+from uuid import UUID, uuid4
 
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import ValidationError
 
 from analytics_agent.maxun.materialization import (
+    MAX_MATERIALIZATION_HARD_SECONDS,
     MAX_REQUEST_BYTES,
     MaterializationError,
     MaterializationRequest,
@@ -28,11 +30,48 @@ def _error(error: MaterializationError) -> HTTPException:
     )
 
 
+def _operation_id(value: str | None, *, required: bool = False) -> str:
+    if value is None:
+        if required:
+            raise MaterializationError(
+                "MATERIALIZATION_INVALID_CONTRACT", "operation id is required", 400
+            )
+        return str(uuid4())
+    try:
+        parsed = str(UUID(value))
+    except (TypeError, ValueError) as error:
+        raise MaterializationError(
+            "MATERIALIZATION_INVALID_CONTRACT", "invalid operation id", 400
+        ) from error
+    if parsed != value:
+        raise MaterializationError("MATERIALIZATION_INVALID_CONTRACT", "invalid operation id", 400)
+    return parsed
+
+
+def _deadline_at(value: str | None) -> float:
+    now = time.time()
+    if value is None:
+        return now + MAX_MATERIALIZATION_HARD_SECONDS
+    try:
+        deadline_ms = int(value)
+    except (TypeError, ValueError) as error:
+        raise MaterializationError(
+            "MATERIALIZATION_INVALID_CONTRACT", "invalid materialization deadline", 400
+        ) from error
+    if deadline_ms <= 0:
+        raise MaterializationError(
+            "MATERIALIZATION_INVALID_CONTRACT", "invalid materialization deadline", 400
+        )
+    return min(deadline_ms / 1000, now + MAX_MATERIALIZATION_HARD_SECONDS)
+
+
 @router.put("/{workspace_id}")
 async def materialize_workspace(
     workspace_id: str,
     request: Request,
     authorization: str | None = Header(default=None),
+    operation_header: str | None = Header(default=None, alias="X-Maxun-Operation-Id"),
+    deadline_header: str | None = Header(default=None, alias="X-Maxun-Deadline-At"),
 ) -> dict:
     try:
         if str(UUID(workspace_id)) != workspace_id:
@@ -58,6 +97,9 @@ async def materialize_workspace(
             _materializer.materialize,
             parsed,
             len(raw_bytes),
+            _operation_id(operation_header),
+            _deadline_at(deadline_header),
+            abandon_on_cancel=False,
         )
     except MaterializationError as error:
         raise _error(error) from error
@@ -115,6 +157,40 @@ def _parse_materialization_request(raw: bytes) -> MaterializationRequest:
     return MaterializationRequest.model_validate(
         json.loads(raw, parse_int=_parse_json_int, parse_float=_parse_json_float)
     )
+
+
+@router.post("/{workspace_id}/cancel", status_code=204)
+async def cancel_materialization(
+    workspace_id: str,
+    authorization: str | None = Header(default=None),
+    operation_header: str | None = Header(default=None, alias="X-Maxun-Operation-Id"),
+) -> None:
+    try:
+        if str(UUID(workspace_id)) != workspace_id:
+            raise ValueError
+        authorize_token(authorization)
+        await anyio.to_thread.run_sync(
+            _materializer.cancel_operation,
+            workspace_id,
+            _operation_id(operation_header, required=True),
+            abandon_on_cancel=False,
+        )
+    except MaterializationError as error:
+        raise _error(error) from error
+    except ValueError as error:
+        raise _error(
+            MaterializationError("MATERIALIZATION_INVALID_CONTRACT", "invalid workspace id")
+        ) from error
+    except Exception as error:
+        logger.warning(
+            "Maxun materialization cancellation failed without exposing internals: %s",
+            type(error).__name__,
+        )
+        raise _error(
+            MaterializationError(
+                "MATERIALIZATION_CANCEL_NOT_CONVERGED", "cancellation unavailable", 503
+            )
+        ) from error
 
 
 @router.delete("/{workspace_id}", status_code=204)

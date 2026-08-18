@@ -503,6 +503,48 @@ def test_failed_build_does_not_publish_partial_final_file(tmp_path: Path, monkey
     assert not list(workspace_dir.glob("workspace.tmp.*.duckdb"))
 
 
+def test_materialization_deadline_fails_before_publish(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    with pytest.raises(MaterializationError) as error:
+        materializer.materialize(
+            request,
+            operation_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            deadline_at=time.time() - 1,
+        )
+    assert error.value.code == "MATERIALIZATION_TIMEOUT"
+    assert not (tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
+
+
+def test_materialization_cancellation_converges_before_publish(tmp_path: Path):
+    request = MaterializationRequest.model_validate(payload())
+    materializer = Materializer(tmp_path)
+    operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    entered = Event()
+
+    def blocked_build(*args, **kwargs):
+        operation = kwargs.get("operation") or args[3]
+        entered.set()
+        while True:
+            operation.check()
+
+    materializer._build = blocked_build
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            materializer.materialize,
+            request,
+            None,
+            operation_id,
+            time.time() + 30,
+        )
+        assert entered.wait(2)
+        assert materializer.cancel_operation(IDS["workspace"], operation_id)
+        with pytest.raises(MaterializationError) as error:
+            future.result(timeout=2)
+    assert error.value.code == "MATERIALIZATION_CANCELLED"
+    assert not (tmp_path / "v1" / IDS["workspace"] / "workspace.duckdb").exists()
+
+
 def test_materialization_capacity_returns_bounded_busy_error(tmp_path: Path):
     request = MaterializationRequest.model_validate(payload())
     materializer = Materializer(tmp_path)
@@ -679,6 +721,51 @@ def test_internal_http_route_enforces_token_and_returns_bounded_response(
     assert response.status_code == 200
     assert response.json()["relation"] == "data"
     assert "workspace.duckdb" not in response.text
+
+
+async def test_http_materialization_cancellation_converges(tmp_path: Path, monkeypatch):
+    app = FastAPI()
+    app.include_router(maxun_api.router)
+    monkeypatch.setenv("MAXUN_ANALYTICS_INTERNAL_TOKEN", "internal-secret")
+    materializer = Materializer(tmp_path)
+    entered = Event()
+
+    def blocked_build(*args, **kwargs):
+        operation = kwargs.get("operation") or args[3]
+        entered.set()
+        while True:
+            operation.check()
+
+    materializer._build = blocked_build
+    monkeypatch.setattr(maxun_api, "_materializer", materializer)
+    body = payload()
+    operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        materialization = asyncio.create_task(
+            client.put(
+                f"/internal/maxun/materializations/{IDS['workspace']}",
+                headers={
+                    "Authorization": "Bearer internal-secret",
+                    "X-Maxun-Operation-Id": operation_id,
+                    "X-Maxun-Deadline-At": str(int(time.time() * 1000) + 30_000),
+                },
+                json=body,
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        cancelled = await client.post(
+            f"/internal/maxun/materializations/{IDS['workspace']}/cancel",
+            headers={
+                "Authorization": "Bearer internal-secret",
+                "X-Maxun-Operation-Id": operation_id,
+            },
+        )
+        assert cancelled.status_code == 204
+        completed = await materialization
+    assert completed.status_code == 409
+    assert completed.json()["detail"]["code"] == "MATERIALIZATION_CANCELLED"
 
 
 async def test_http_materialization_does_not_block_lightweight_requests(
