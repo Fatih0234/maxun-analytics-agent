@@ -98,11 +98,11 @@ class Source(BaseModel):
     robotId: str
     mappingId: str
     dataFormatId: str
-    sourceDatasetKey: str
-    sourceSchemaSignature: str
-    displayName: str
-    role: str
-    capturedAt: str
+    sourceDatasetKey: str = Field(min_length=1, max_length=255)
+    sourceSchemaSignature: str = Field(min_length=1, max_length=255)
+    displayName: str = Field(min_length=1, max_length=255)
+    role: str = Field(min_length=1, max_length=64)
+    capturedAt: str = Field(min_length=1, max_length=128)
     projection: Projection
 
 

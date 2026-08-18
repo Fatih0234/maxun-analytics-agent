@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -91,6 +93,14 @@ def test_workspace_queries_are_read_only_and_bounded(workspace: Path):
         assert engine._run_query("WITH x AS (SELECT * FROM data) SELECT COUNT(*) AS n FROM x")[
             "rows"
         ] == [{"n": 2}]
+        aliased = engine._run_query(
+            'SELECT mine."Price" AS mine_price, competitor."Price" AS competitor_price '
+            'FROM data AS mine JOIN data AS competitor ON mine."Name" = competitor."Name"'
+        )
+        assert aliased["rows"] == [
+            {"mine_price": 1.5, "competitor_price": 1.5},
+            {"mine_price": 2.5, "competitor_price": 2.5},
+        ]
     finally:
         asyncio.run(engine.aclose())
 
@@ -110,6 +120,8 @@ def test_workspace_queries_are_read_only_and_bounded(workspace: Path):
         "INSERT INTO data SELECT * FROM data",
         "SELECT 1",
         "SELECT * FROM data; SELECT 1",
+        'SELECT unknown."Price" FROM data AS mine',
+        'WITH source AS (SELECT * FROM data) SELECT source."Price" FROM source AS source',
     ],
 )
 def test_ast_policy_rejects_external_access_writes_and_fallbacks(sql: str):
@@ -258,6 +270,71 @@ def test_cancel_active_interrupts_running_duckdb_connection(workspace: Path):
         asyncio.run(engine.aclose())
 
 
+def test_source_context_is_bounded_and_uses_exact_source_order(workspace: Path):
+    body = request_body()
+    second = copy.deepcopy(body["sources"][0])
+    second.update(
+        {
+            "workspaceSourceId": "88888888-8888-4888-8888-888888888888",
+            "projectionId": "99999999-9999-4999-8999-999999999999",
+            "runId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "robotId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "mappingId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "sourceOrder": 1,
+            "displayName": "Competitor capture",
+            "role": "competitor",
+            "sourceDatasetKey": "competitor-products",
+            "projection": {"columns": ["Price", "Name"], "rows": [{"Price": "3.5", "Name": "A"}]},
+        }
+    )
+    body["sources"].append(second)
+    root = workspace / "multi-source"
+    Materializer(root).materialize(MaterializationRequest.model_validate(body))
+    engine = MaxunWorkspaceEngine(IDS["workspace"], root=root)
+    try:
+        aggregate = engine._run_query(
+            'SELECT "_source_order" AS source_order, COUNT(*) AS rows '
+            'FROM data GROUP BY "_source_order" ORDER BY source_order'
+        )
+        assert aggregate["rows"] == [{"source_order": 0, "rows": 2}, {"source_order": 1, "rows": 1}]
+        comparison = engine._run_query(
+            'SELECT own."Name" AS product, own."Price" AS own_price, '
+            'competitor."Price" AS competitor_price '
+            "FROM data AS own JOIN data AS competitor "
+            'ON own."Name" = competitor."Name" '
+            'WHERE own."_source_order" = 0 AND competitor."_source_order" = 1'
+        )
+        assert comparison["rows"] == [{"product": "A", "own_price": 1.5, "competitor_price": 3.5}]
+        engine.configure_turn_budget(max_query_tools=3, max_sql_executions=1)
+        context_tool = next(
+            tool for tool in engine.get_tools() if tool.name == "get_source_context"
+        )
+        context = json.loads(context_tool.invoke({}))
+        assert context["sourceCount"] == 2
+        assert [source["sourceOrder"] for source in context["sources"]] == [0, 1]
+        assert [source["displayName"] for source in context["sources"]] == [
+            "Catalog",
+            "Competitor capture",
+        ]
+        assert "Do not fuzzy-match source names or row entities." in context["rules"]
+    finally:
+        asyncio.run(engine.aclose())
+
+
+def test_source_context_counts_against_the_bounded_query_tool_budget(workspace: Path):
+    engine = MaxunWorkspaceEngine(IDS["workspace"], root=workspace)
+    engine.configure_turn_budget(max_query_tools=1, max_sql_executions=1)
+    try:
+        context_tool = next(
+            tool for tool in engine.get_tools() if tool.name == "get_source_context"
+        )
+        execute = next(tool for tool in engine.get_tools() if tool.name == "execute_sql")
+        assert json.loads(context_tool.invoke({}))["sourceCount"] == 1
+        assert "MAXUN_QUERY_LIMIT" in execute.invoke({"sql": "SELECT COUNT(*) FROM data"})
+    finally:
+        asyncio.run(engine.aclose())
+
+
 def test_per_turn_tool_budget_limits_sql_execution(workspace: Path):
     engine = MaxunWorkspaceEngine(IDS["workspace"], root=workspace)
     engine.configure_turn_budget(max_query_tools=3, max_sql_executions=1)
@@ -277,6 +354,7 @@ def test_fixed_tool_surface_exposes_only_data_relation(workspace: Path):
     try:
         assert {tool.name for tool in engine.get_tools()} == {
             "execute_sql",
+            "get_source_context",
             "list_tables",
             "get_schema",
             "preview_table",
