@@ -94,7 +94,10 @@ def test_maxun_profile_preserves_explicit_telemetry_setting(monkeypatch):
 
 def test_maxun_image_declares_a_non_root_runtime():
     dockerfile = (Path(__file__).parents[2] / "docker" / "Dockerfile").read_text()
-    assert "useradd --system --uid 10001" in dockerfile
+    assert (
+        "useradd --system --uid 10001" in dockerfile
+        or "adduser -S -D -u 10001" in dockerfile
+    )
     assert "USER analytics-agent" in dockerfile
 
 
