@@ -278,6 +278,33 @@ def test_supported_types_and_typed_blanks_are_materialized(tmp_path: Path):
     assert values[1][4:] == (None, "x", "oops")
 
 
+def test_multi_source_declared_numeric_fallback_fails_closed(tmp_path: Path):
+    body = payload(columns=["Product ID", "Price"], rows=[{"Product ID": "sku-1", "Price": "9"}])
+    body["workspace"]["dataFormatSnapshot"]["columns"] = [
+        {"name": "Product ID", "type": "text"},
+        {"name": "Price", "type": "number"},
+    ]
+    body["sources"][0]["projection"]["rows"].append({"Product ID": "sku-bad", "Price": "N/A"})
+    second = dict(body["sources"][0])
+    second.update(
+        {
+            "workspaceSourceId": "88888888-8888-4888-8888-888888888888",
+            "projectionId": "99999999-9999-4999-8999-999999999999",
+            "sourceOrder": 1,
+            "displayName": "Competitor",
+            "role": "competitor",
+            "projection": {
+                "columns": ["Product ID", "Price"],
+                "rows": [{"Product ID": "sku-1", "Price": "10"}],
+            },
+        }
+    )
+    body["sources"].append(second)
+    with pytest.raises(MaterializationError) as error:
+        Materializer(tmp_path).materialize(MaterializationRequest.model_validate(body))
+    assert error.value.code == "MATERIALIZATION_SCHEMA_MISMATCH"
+
+
 def test_malformed_date_and_boolean_fallbacks_preserve_original_text(tmp_path: Path):
     columns = ["Day", "Flag"]
     rows = [{"Day": "2026-01-01", "Flag": "true"}, {"Day": "bad", "Flag": "0"}]

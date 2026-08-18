@@ -45,6 +45,22 @@ RESERVED_COLUMNS = {
     "_source_order",
 }
 RESERVED_COLUMNS_CASE_INSENSITIVE = {column.lower() for column in RESERVED_COLUMNS}
+STRICT_ANALYTICAL_HINTS = frozenset(
+    {
+        "number",
+        "numeric",
+        "float",
+        "decimal",
+        "price",
+        "year",
+        "boolean",
+        "bool",
+        "date",
+        "datetime",
+        "timestamp",
+        "time",
+    }
+)
 SYSTEM_COLUMNS = [
     ("_source", "VARCHAR"),
     ("_source_role", "VARCHAR"),
@@ -98,11 +114,11 @@ class Source(BaseModel):
     robotId: str
     mappingId: str
     dataFormatId: str
-    sourceDatasetKey: str
-    sourceSchemaSignature: str
-    displayName: str
-    role: str
-    capturedAt: str
+    sourceDatasetKey: str = Field(min_length=1, max_length=255)
+    sourceSchemaSignature: str = Field(min_length=1, max_length=255)
+    displayName: str = Field(min_length=1, max_length=255)
+    role: str = Field(min_length=1, max_length=64)
+    capturedAt: str = Field(min_length=1, max_length=128)
     projection: Projection
 
 
@@ -594,9 +610,14 @@ class Materializer:
         ]
         specs = []
         for ordinal, (logical, name, mapped) in enumerate(physical):
-            dtype, rule = _type_and_rule(
-                all_values[ordinal], _hint(request.workspace.dataFormatSnapshot, logical)
-            )
+            hint = _hint(request.workspace.dataFormatSnapshot, logical)
+            dtype, rule = _type_and_rule(all_values[ordinal], hint)
+            if len(request.sources) > 1 and hint in STRICT_ANALYTICAL_HINTS and dtype == "VARCHAR":
+                raise MaterializationError(
+                    "MATERIALIZATION_SCHEMA_MISMATCH",
+                    "multi-source analytical typing is unsafe",
+                    409,
+                )
             if dtype != "VARCHAR":
                 try:
                     for value in all_values[ordinal]:

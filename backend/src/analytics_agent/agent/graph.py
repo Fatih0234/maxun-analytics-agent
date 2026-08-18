@@ -54,8 +54,8 @@ def build_graph(
     if maxun_readonly:
         # This profile is intentionally independent of DB-configured context
         # platforms, skills, mutations, and chart generation. The only tools
-        # it can receive are the four fixed tools returned by the workspace
-        # engine.
+        # it can receive are the fixed read-only tools returned by the
+        # workspace engine.
         datahub_tools = []
         skill_tools = []
         chart_tools = []
@@ -66,7 +66,14 @@ def build_graph(
         engine_tools = [
             tool
             for tool in engine_tools
-            if tool.name in {"execute_sql", "list_tables", "get_schema", "preview_table"}
+            if tool.name
+            in {
+                "execute_sql",
+                "get_source_context",
+                "list_tables",
+                "get_schema",
+                "preview_table",
+            }
         ]
         all_tools = engine_tools
     else:
@@ -101,10 +108,13 @@ def build_graph(
 
     if maxun_readonly:
         system_prompt = (
-            "You answer questions about one immutable Maxun workspace. "
+            "You answer questions about one immutable Maxun workspace that may contain multiple exact sources. "
             "Use only the provided read-only data tools and only the data relation. "
-            "Never request charts, context, mutations, external files, or another connection. "
-            "For a data question, inspect the schema if needed, execute one safe SQL query, "
+            "Never request charts, external context, mutations, external files, or another connection. "
+            "Use get_source_context when source identity or source roles matter, and use _source_order "
+            "for exact source filtering/grouping; display names are presentation only. "
+            "Do not fuzzy-match sources or row entities, and only compare sources using an explicit exact shared identifier. "
+            "For a data question, inspect the source context/schema if needed, execute one safe SQL query, "
             "and explain the bounded result concisely. Do not invent values."
         )
     elif system_prompt_override:
