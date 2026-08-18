@@ -27,6 +27,7 @@ import orjson
 from langchain_core.tools import BaseTool, tool
 from sqlglot import exp, parse
 from sqlglot.errors import ParseError
+from sqlglot.optimizer.scope import traverse_scope
 
 from analytics_agent.engines.base import QueryEngine
 from analytics_agent.maxun.materialization import Materializer
@@ -216,20 +217,16 @@ def _validate_artifact(
         raise MaxunQueryError("MAXUN_WORKSPACE_INTEGRITY", "Workspace data is unavailable")
 
 
-def _cte_names(root: exp.Expression) -> set[str]:
-    with_expression = root.args.get("with") or root.args.get("with_")
-    if not with_expression:
-        return set()
-    names: set[str] = set()
-    for cte in with_expression.find_all(exp.CTE):
-        alias = cte.alias_or_name
-        if alias:
-            if alias.casefold() == "data":
-                raise MaxunSQLPolicyError()
-            names.add(alias.casefold())
-    if with_expression.args.get("recursive"):
-        raise MaxunSQLPolicyError()
-    return names
+def _validate_cte_names(root: exp.Expression) -> None:
+    for with_expression in root.find_all(exp.With):
+        if with_expression.args.get("recursive"):
+            raise MaxunSQLPolicyError()
+        for cte in with_expression.find_all(exp.CTE):
+            alias = cte.alias_or_name
+            if alias:
+                folded_alias = alias.casefold()
+                if folded_alias == "data" or folded_alias.startswith("__maxun_"):
+                    raise MaxunSQLPolicyError()
 
 
 def validate_sql(sql: str) -> str:
@@ -258,34 +255,53 @@ def validate_sql(sql: str) -> str:
     if not isinstance(root, allowed_roots):
         raise MaxunSQLPolicyError()
 
-    ctes = _cte_names(root)
+    _validate_cte_names(root)
     saw_data = False
-    approved_qualifiers = set(ctes)
-    declared_aliases: set[str] = set()
-    for table in root.find_all(exp.Table):
-        # Database/catalog-qualified names and table functions are not part of
-        # the Maxun relation contract.
-        if table.db or table.catalog:
-            raise MaxunSQLPolicyError()
-        name = table.name
-        folded_name = name.casefold()
-        if folded_name == "data" and folded_name not in ctes:
-            saw_data = True
-        elif folded_name not in ctes:
-            raise MaxunSQLPolicyError()
+    try:
+        scopes = traverse_scope(root)
+    except Exception:
+        raise MaxunSQLPolicyError() from None
+    if not scopes:
+        raise MaxunSQLPolicyError()
 
-        alias = table.alias
-        if alias:
-            folded_alias = alias.casefold()
-            # An alias may only resolve to an already-approved relation. Do
-            # not allow it to shadow a CTE or another relation alias, because
-            # that makes the column-qualifier policy scope-dependent.
-            if folded_alias in ctes or folded_alias in declared_aliases:
+    for scope in scopes:
+        visible_ctes = {name.casefold() for name in scope.cte_sources}
+        approved_qualifiers = set(visible_ctes)
+        declared_aliases: set[str] = set()
+        for table in scope.tables:
+            # Database/catalog-qualified names and table functions are not part
+            # of the Maxun relation contract. Only a base data table or a CTE
+            # visible in this exact lexical scope is approved.
+            if table.db or table.catalog:
                 raise MaxunSQLPolicyError()
-            declared_aliases.add(folded_alias)
-            approved_qualifiers.add(folded_alias)
-        else:
-            approved_qualifiers.add(folded_name)
+            folded_name = table.name.casefold()
+            is_data = folded_name == "data"
+            is_visible_cte = folded_name in visible_ctes
+            if not is_data and not is_visible_cte:
+                raise MaxunSQLPolicyError()
+            if is_data:
+                saw_data = True
+
+            alias = table.alias
+            if alias:
+                folded_alias = alias.casefold()
+                # An alias may only resolve to an approved local relation. Do
+                # not allow it to shadow a visible CTE or another local alias.
+                if (
+                    folded_alias.startswith("__maxun_")
+                    or folded_alias in visible_ctes
+                    or folded_alias in declared_aliases
+                ):
+                    raise MaxunSQLPolicyError()
+                declared_aliases.add(folded_alias)
+                approved_qualifiers.add(folded_alias)
+            else:
+                approved_qualifiers.add(folded_name)
+
+        for column in scope.columns:
+            qualifier = column.table
+            if qualifier and qualifier.casefold() not in approved_qualifiers:
+                raise MaxunSQLPolicyError()
 
     # A subquery in FROM or an expression can introduce a relation/function
     # shape that is difficult to reason about. CTEs provide the approved,
@@ -300,11 +316,6 @@ def validate_sql(sql: str) -> str:
             "Values",
         }:
             raise MaxunSQLPolicyError()
-
-        if isinstance(node, exp.Column):
-            qualifier = node.table
-            if qualifier and qualifier.casefold() not in approved_qualifiers:
-                raise MaxunSQLPolicyError()
 
         if isinstance(node, exp.Func) and not isinstance(node, (exp.And, exp.Or)):
             try:

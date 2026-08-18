@@ -45,6 +45,22 @@ RESERVED_COLUMNS = {
     "_source_order",
 }
 RESERVED_COLUMNS_CASE_INSENSITIVE = {column.lower() for column in RESERVED_COLUMNS}
+STRICT_ANALYTICAL_HINTS = frozenset(
+    {
+        "number",
+        "numeric",
+        "float",
+        "decimal",
+        "price",
+        "year",
+        "boolean",
+        "bool",
+        "date",
+        "datetime",
+        "timestamp",
+        "time",
+    }
+)
 SYSTEM_COLUMNS = [
     ("_source", "VARCHAR"),
     ("_source_role", "VARCHAR"),
@@ -594,9 +610,14 @@ class Materializer:
         ]
         specs = []
         for ordinal, (logical, name, mapped) in enumerate(physical):
-            dtype, rule = _type_and_rule(
-                all_values[ordinal], _hint(request.workspace.dataFormatSnapshot, logical)
-            )
+            hint = _hint(request.workspace.dataFormatSnapshot, logical)
+            dtype, rule = _type_and_rule(all_values[ordinal], hint)
+            if len(request.sources) > 1 and hint in STRICT_ANALYTICAL_HINTS and dtype == "VARCHAR":
+                raise MaterializationError(
+                    "MATERIALIZATION_SCHEMA_MISMATCH",
+                    "multi-source analytical typing is unsafe",
+                    409,
+                )
             if dtype != "VARCHAR":
                 try:
                     for value in all_values[ordinal]:

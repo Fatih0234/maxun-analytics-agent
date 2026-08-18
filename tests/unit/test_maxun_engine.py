@@ -109,6 +109,10 @@ def test_workspace_queries_are_read_only_and_bounded(workspace: Path):
     "sql",
     [
         "SELECT * FROM other",
+        "SELECT * FROM __maxun_sources",
+        "WITH __maxun_sources AS (SELECT * FROM data) SELECT * FROM __maxun_sources",
+        "WITH outer_cte AS (WITH __maxun_sources AS (SELECT * FROM data) SELECT * FROM __maxun_sources) SELECT * FROM __maxun_sources",
+        "WITH outer_cte AS (WITH __maxun_manifest AS (SELECT * FROM data) SELECT * FROM __maxun_manifest) SELECT * FROM __maxun_manifest",
         "SELECT duckdb_databases() FROM data",
         "SELECT read_csv('/etc/passwd') FROM data",
         "SELECT * FROM read_parquet('/tmp/private.parquet')",
