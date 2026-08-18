@@ -925,6 +925,7 @@ class Materializer:
             specs.append((ordinal, logical, name, dtype, rule, mapped))
         if operation is not None:
             operation.check()
+        _validate_regular_file(path, allow_missing=True)
         connection = duckdb.connect(str(path))
         if operation is not None:
             operation.set_connection(connection)
