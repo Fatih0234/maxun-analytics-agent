@@ -72,6 +72,26 @@ def test_general_profile_retains_the_existing_application_surface():
     assert "/internal/maxun/materializations/{workspace_id}" in paths
 
 
+def test_maxun_profile_disables_telemetry_by_default(monkeypatch):
+    from analytics_agent.config import settings
+    from analytics_agent.main import _configure_maxun_profile_defaults
+
+    monkeypatch.delenv("DATAHUB_TELEMETRY_ENABLED", raising=False)
+    settings.datahub_telemetry_enabled = True
+    _configure_maxun_profile_defaults()
+    assert settings.datahub_telemetry_enabled is False
+
+
+def test_maxun_profile_preserves_explicit_telemetry_setting(monkeypatch):
+    from analytics_agent.config import settings
+    from analytics_agent.main import _configure_maxun_profile_defaults
+
+    monkeypatch.setenv("DATAHUB_TELEMETRY_ENABLED", "true")
+    settings.datahub_telemetry_enabled = True
+    _configure_maxun_profile_defaults()
+    assert settings.datahub_telemetry_enabled is True
+
+
 def test_maxun_image_declares_a_non_root_runtime():
     dockerfile = (Path(__file__).parents[2] / "docker" / "Dockerfile").read_text()
     assert "useradd --system --uid 10001" in dockerfile

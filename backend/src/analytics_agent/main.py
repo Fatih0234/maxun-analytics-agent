@@ -74,6 +74,11 @@ def _maxun_allowed_llm_hosts() -> set[str]:
     } | set(_DEFAULT_MAXUN_LLM_HOSTS)
 
 
+def _configure_maxun_profile_defaults() -> None:
+    if "DATAHUB_TELEMETRY_ENABLED" not in os.environ:
+        settings.datahub_telemetry_enabled = False
+
+
 def _validate_maxun_llm_egress() -> None:
     """Reject arbitrary custom LLM destinations in the Maxun profile.
 
@@ -156,6 +161,8 @@ async def lifespan(app: FastAPI):
     from analytics_agent.build_identity import validate_build_identity
 
     maxun_only = getattr(app.state, "analytics_agent_profile", "general") == "maxun"
+    if maxun_only:
+        _configure_maxun_profile_defaults()
     validate_build_identity()
 
     # Fail fast if rows are encrypted but the master key is absent. The
